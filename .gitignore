@@ -1,0 +1,40 @@
+# Credentials - NEVER commit these!
+credentials.py
+
+# Cache files
+odds_cache.json
+api_usage.json
+
+# Process files
+trader.pid
+trader.log
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+
+# Claude
+.claude/
