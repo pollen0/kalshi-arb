@@ -109,7 +109,7 @@ class RiskConfig:
     """Risk management configuration — shared across financial and sports systems"""
 
     # === Shared risk (applies to both financial + sports) ===
-    max_daily_loss_pct: float = 0.05            # Stop if down 5%
+    max_daily_loss_pct: float = 0.10            # Stop if down 10% (relaxed for small accounts)
     max_drawdown_pct: float = 0.15              # Max 15% drawdown from peak equity
     max_total_exposure: float = 0.80            # Max 80% total exposure
 

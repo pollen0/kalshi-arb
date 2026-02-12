@@ -448,20 +448,32 @@ def create_app():
 
             # Update Treasury 10Y markets (KXTNOTED)
             try:
+                # Always fetch markets from Kalshi, regardless of quote availability
+                tnote_markets = state["client"].get_markets(series_ticker="KXTNOTED", status="active")
+                treasury_markets = []
+
+                # Try to get treasury quote (with Yahoo Finance fallback via get_quote)
                 treasury_quote = state["futures_quotes"].get("treasury10y")
+                treasury_price = None
                 if treasury_quote and treasury_quote.price:
                     treasury_price = treasury_quote.price
+                else:
+                    # Fallback: fetch directly (triggers Yahoo Finance fallback inside get_quote)
+                    fallback_quote = state["futures"].get_quote("treasury10y")
+                    if fallback_quote and fallback_quote.price:
+                        treasury_price = fallback_quote.price
+                        print(f"[MARKETS] Treasury quote from fallback: {treasury_price:.3f}%")
 
+                if treasury_price:
                     # Get historical volatility for Treasury
                     treasury_vol = state["futures"].get_historical_volatility("treasury10y", 30)
                     if treasury_vol:
                         fv_model.historical_vols["treasury10y"] = treasury_vol
 
-                    treasury_markets = []
-                    tnote_markets = state["client"].get_markets(series_ticker="KXTNOTED", status="active")
-                    for m in (tnote_markets or []):
-                        hours = hours_until(m.close_time)
-                        if hours and hours > 0:
+                for m in (tnote_markets or []):
+                    hours = hours_until(m.close_time)
+                    if hours and hours > 0:
+                        if treasury_price:
                             # Treasury markets: lower_bound and upper_bound are yield values
                             if m.lower_bound is not None and m.upper_bound is not None:
                                 # Range market
@@ -499,11 +511,12 @@ def create_app():
                             m.fair_value = fv_result.probability
                             m.fair_value_time = datetime.now(timezone.utc)
                             m.model_source = f"10Y={treasury_price:.3f}%"
-                            treasury_markets.append(m)
+                        treasury_markets.append(m)
 
-                    state["markets"]["treasury"] = sorted(treasury_markets, key=lambda x: x.lower_bound or 0)
-                    if treasury_markets:
-                        print(f"[MARKETS] Loaded {len(treasury_markets)} Treasury markets, yield={treasury_price:.3f}%")
+                state["markets"]["treasury"] = sorted(treasury_markets, key=lambda x: x.lower_bound or 0)
+                if treasury_markets:
+                    price_str = f", yield={treasury_price:.3f}%" if treasury_price else " (no quote)"
+                    print(f"[MARKETS] Loaded {len(treasury_markets)} Treasury markets{price_str}")
             except Exception as e:
                 print(f"[MARKETS] Error fetching Treasury: {e}")
                 import traceback
@@ -1454,6 +1467,7 @@ def create_app():
                 "sports_min_edge": (0.01, 0.30),            # 1%-30%
                 "financial_position_size": (1, 200),
                 "sports_position_size": (1, 200),
+                "max_total_orders": (5, 200),
             }
             for key, (lo, hi) in _BOUNDS.items():
                 if key in data:
@@ -1479,6 +1493,13 @@ def create_app():
             if "sports_position_size" in data:
                 rc.sports_position_size = int(data["sports_position_size"])
 
+            # Handle max_total_orders (lives on TraderConfig, not RiskConfig)
+            if "max_total_orders" in data:
+                max_orders_val = int(data["max_total_orders"])
+                trader = state.get("auto_trader")
+                if trader:
+                    trader.config.max_total_orders = max_orders_val
+
             # Propagate to live subsystems
             trader = state.get("auto_trader")
             if trader:
@@ -1496,12 +1517,14 @@ def create_app():
             # Persist to disk
             save_config()
 
+        trader = state.get("auto_trader")
         return jsonify({
             "max_daily_loss_pct": rc.max_daily_loss_pct,
             "max_drawdown_pct": rc.max_drawdown_pct,
             "max_total_exposure": rc.max_total_exposure,
             "financial_min_edge": rc.financial_min_edge,
             "financial_position_size": rc.financial_position_size,
+            "max_total_orders": trader.config.max_total_orders if trader else 20,
             "sports_min_edge": rc.sports_min_edge,
             "sports_position_size": rc.sports_position_size,
         })
@@ -2895,6 +2918,10 @@ DASHBOARD_HTML = '''
                         <input type="number" id="cfg-fin-position-size" value="10" step="5" min="1" max="100">
                     </div>
                     <div class="config-item">
+                        <label>Max Orders</label>
+                        <input type="number" id="cfg-max-orders" value="20" step="5" min="5" max="200">
+                    </div>
+                    <div class="config-item">
                         <label>Sports Min Edge</label>
                         <input type="number" id="cfg-sports-min-edge" value="5" step="0.5" min="1" max="20"> %
                     </div>
@@ -3674,6 +3701,7 @@ DASHBOARD_HTML = '''
                     max_total_exposure: parseFloat(document.getElementById('cfg-max-exposure').value) / 100,
                     financial_min_edge: parseFloat(document.getElementById('cfg-fin-min-edge').value) / 100,
                     financial_position_size: parseInt(document.getElementById('cfg-fin-position-size').value),
+                    max_total_orders: parseInt(document.getElementById('cfg-max-orders').value),
                     sports_min_edge: parseFloat(document.getElementById('cfg-sports-min-edge').value) / 100,
                     sports_position_size: parseInt(document.getElementById('cfg-sports-bet-size').value),
                 };
@@ -3702,6 +3730,7 @@ DASHBOARD_HTML = '''
                 document.getElementById('cfg-max-exposure').value = (data.max_total_exposure * 100).toFixed(0);
                 document.getElementById('cfg-fin-min-edge').value = (data.financial_min_edge * 100).toFixed(1);
                 document.getElementById('cfg-fin-position-size').value = data.financial_position_size;
+                document.getElementById('cfg-max-orders').value = data.max_total_orders || 20;
                 document.getElementById('cfg-sports-min-edge').value = (data.sports_min_edge * 100).toFixed(1);
                 document.getElementById('cfg-sports-bet-size').value = data.sports_position_size;
             } catch (err) {}
