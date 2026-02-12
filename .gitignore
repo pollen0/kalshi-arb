@@ -1,13 +1,16 @@
 # Credentials - NEVER commit these!
 credentials.py
+.env
 
 # Cache files
 odds_cache.json
 api_usage.json
 
+# Order tracking data
+data/
+
 # Process files
-trader.pid
-trader.log
+*.pid
 *.log
 
 # Python
