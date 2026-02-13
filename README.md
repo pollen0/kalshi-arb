@@ -41,9 +41,6 @@ python app.py
     │   ├── futures.py        # Yahoo Finance client (NQ, ES)
     │   └── fair_value.py     # Range probability calculations
     │
-    ├── sports/
-    │   └── odds_api.py       # The Odds API client (optional)
-    │
     └── web/
         └── app.py            # Flask dashboard
 ```
@@ -81,12 +78,6 @@ KALSHI_PRIVATE_KEY = """-----BEGIN RSA PRIVATE KEY-----
 ...your private key content...
 -----END RSA PRIVATE KEY-----"""
 ```
-
-### The Odds API (Optional - for sports)
-
-1. Sign up at [The Odds API](https://the-odds-api.com/)
-2. Get your free API key (500 requests/month)
-3. Set environment variable: `export ODDS_API_KEY="your-key"`
 
 ## Strategy
 

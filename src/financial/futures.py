@@ -1,14 +1,18 @@
 """
 Market data client using InsightSentry (real-time) via RapidAPI
++ Binance (real-time crypto) via public API
 
 IMPORTANT: Kalshi markets settle to CASH INDICES, not futures!
 - NASDAQ-100 markets settle to NDX (InsightSentry: NASDAQ:NDX)
 - S&P 500 markets settle to SPX (InsightSentry: CBOE:SPX)
+- Crypto markets settle to CF Benchmarks Real-Time Index
 
 Primary: InsightSentry REST API — all symbols in ONE batch call, 0s delay
+         Binance REST API — crypto prices (free, no auth)
 Fallback: Yahoo Finance for historical volatility calculation
 """
 
+import json
 import math
 import os
 import threading
@@ -24,6 +28,7 @@ from ..core.models import FuturesQuote
 ET = ZoneInfo("America/New_York")
 
 INSIGHTSENTRY_BASE = "https://insightsentry.p.rapidapi.com"
+BINANCE_BASE = "https://api.binance.com"
 
 
 class FuturesClient:
@@ -37,6 +42,16 @@ class FuturesClient:
         "treasury10y": "IS:TNX",     # 10-Year Treasury Yield
         "usdjpy": "FX:USDJPY",       # USD/JPY
         "eurusd": "FX:EURUSD",       # EUR/USD
+        "wti": "NYMEX:CL1!",        # WTI Crude Oil Front Month
+    }
+
+    # Binance symbols for crypto (free public API, no auth needed)
+    BINANCE_TICKERS = {
+        "bitcoin": "BTCUSDT",
+        "ethereum": "ETHUSDT",
+        "solana": "SOLUSDT",
+        "dogecoin": "DOGEUSDT",
+        "xrp": "XRPUSDT",
     }
 
     # InsightSentry futures symbols (for overnight basis adjustment)
@@ -52,6 +67,12 @@ class FuturesClient:
         "treasury10y": "^TNX",
         "usdjpy": "USDJPY=X",
         "eurusd": "EURUSD=X",
+        "wti": "CL=F",
+        "bitcoin": "BTC-USD",
+        "ethereum": "ETH-USD",
+        "solana": "SOL-USD",
+        "dogecoin": "DOGE-USD",
+        "xrp": "XRP-USD",
     }
 
     # Legacy aliases (backward compatibility)
@@ -224,6 +245,10 @@ class FuturesClient:
                 self._last_basis[key] = new_basis
                 self._last_basis_time[key] = datetime.now(timezone.utc)
 
+        # Also fetch crypto from Binance and merge
+        crypto_quotes = self._fetch_binance_prices()
+        quotes.update(crypto_quotes)
+
         return quotes
 
     def _fetch_single_quote(self, index: str) -> Optional[FuturesQuote]:
@@ -359,6 +384,18 @@ class FuturesClient:
         overnight sessions using futures-adjusted prices.
         """
         index_lower = index.lower()
+
+        # Route crypto to Binance
+        if index_lower in self.BINANCE_TICKERS:
+            quote = self._fetch_single_binance_quote(index_lower)
+            if quote:
+                return quote
+            # Fallback to yfinance for crypto
+            yf_symbol = self.HIST_SYMBOLS.get(index_lower)
+            if yf_symbol:
+                return self._fetch_quote_yfinance(yf_symbol, index_lower)
+            return None
+
         is_code = self.IS_TICKERS.get(index_lower)
 
         # Check cache
@@ -443,7 +480,7 @@ class FuturesClient:
         """
         Get best available price estimates for all indices.
         Single API call for all symbols. Uses futures-adjusted prices
-        during off-hours for equities.
+        during off-hours for equities. Crypto is always live (24/7).
         """
         quotes = self._fetch_all_realtime()
 
@@ -464,7 +501,8 @@ class FuturesClient:
     def get_all_volatilities(self, days: int = 30) -> dict[str, float]:
         """Get historical volatilities for all tracked assets."""
         vols = {}
-        for index in ["nasdaq", "spx", "treasury10y", "usdjpy", "eurusd"]:
+        for index in ["nasdaq", "spx", "treasury10y", "usdjpy", "eurusd", "wti",
+                      "bitcoin", "ethereum", "solana", "dogecoin", "xrp"]:
             vol = self.get_historical_volatility(index, days)
             if vol:
                 vols[index] = vol
@@ -498,6 +536,90 @@ class FuturesClient:
         if futures and spot and futures.price and spot.price:
             return (futures.price - spot.price) / spot.price
         return None
+
+    # ========================================================================
+    # Binance API (crypto)
+    # ========================================================================
+
+    def _fetch_binance_prices(self) -> dict[str, FuturesQuote]:
+        """Fetch all crypto prices from Binance in a single API call."""
+        symbols = list(self.BINANCE_TICKERS.values())
+        reverse_map = {v: k for k, v in self.BINANCE_TICKERS.items()}
+
+        try:
+            resp = requests.get(
+                f"{BINANCE_BASE}/api/v3/ticker/24hr",
+                params={"symbols": json.dumps(symbols)},
+                timeout=8,
+            )
+            if resp.status_code != 200:
+                print(f"[BINANCE] HTTP {resp.status_code}")
+                return {}
+
+            data = resp.json()
+            quotes = {}
+            for item in data:
+                symbol = item.get("symbol", "")
+                key = reverse_map.get(symbol)
+                if not key:
+                    continue
+
+                price = float(item.get("lastPrice", 0))
+                if price <= 0:
+                    continue
+
+                quote = FuturesQuote(
+                    symbol=symbol,
+                    price=price,
+                    change=float(item.get("priceChange", 0)),
+                    change_pct=float(item.get("priceChangePercent", 0)),
+                )
+                quotes[key] = quote
+                self._set_cached(f"BINANCE:{symbol}", quote)
+
+            return quotes
+
+        except Exception as e:
+            print(f"[BINANCE] Error: {e}")
+            return {}
+
+    def _fetch_single_binance_quote(self, index: str) -> Optional[FuturesQuote]:
+        """Fetch a single crypto quote from Binance."""
+        symbol = self.BINANCE_TICKERS.get(index)
+        if not symbol:
+            return None
+
+        # Check cache
+        cached = self._get_cached(f"BINANCE:{symbol}")
+        if cached:
+            return cached
+
+        try:
+            resp = requests.get(
+                f"{BINANCE_BASE}/api/v3/ticker/24hr",
+                params={"symbol": symbol},
+                timeout=8,
+            )
+            if resp.status_code != 200:
+                return None
+
+            item = resp.json()
+            price = float(item.get("lastPrice", 0))
+            if price <= 0:
+                return None
+
+            quote = FuturesQuote(
+                symbol=symbol,
+                price=price,
+                change=float(item.get("priceChange", 0)),
+                change_pct=float(item.get("priceChangePercent", 0)),
+            )
+            self._set_cached(f"BINANCE:{symbol}", quote)
+            return quote
+
+        except Exception as e:
+            print(f"[BINANCE] Error fetching {symbol}: {e}")
+            return None
 
     # ========================================================================
     # Internal helpers

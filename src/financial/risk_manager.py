@@ -67,6 +67,23 @@ class RiskManager:
         "KXINX": "spx",
         "KXINXU": "spx",
         "KXTNOTED": "treasury",
+        "KXWTI": "wti",
+        "KXWTIW": "wti",
+        "KXBTC": "crypto",
+        "KXBTC15M": "crypto",
+        "KXBTCD": "crypto",
+        "KXETH": "crypto",
+        "KXETH15M": "crypto",
+        "KXETHD": "crypto",
+        "KXSOL": "crypto",
+        "KXSOL15M": "crypto",
+        "KXSOLD": "crypto",
+        "KXDOGE": "crypto",
+        "KXDOGE15M": "crypto",
+        "KXDOGED": "crypto",
+        "KXXRP": "crypto",
+        "KXXRP15M": "crypto",
+        "KXXRPD": "crypto",
     }
 
     def __init__(self):
@@ -101,6 +118,18 @@ class RiskManager:
             return "spx"
         elif "TNOTE" in ticker_upper or "TREASURY" in ticker_upper:
             return "treasury"
+        elif "WTI" in ticker_upper or "OIL" in ticker_upper or "CRUDE" in ticker_upper:
+            return "wti"
+        elif "BTC" in ticker_upper or "BITCOIN" in ticker_upper:
+            return "crypto"
+        elif "ETH" in ticker_upper or "ETHEREUM" in ticker_upper:
+            return "crypto"
+        elif "SOL" in ticker_upper or "SOLANA" in ticker_upper:
+            return "crypto"
+        elif "DOGE" in ticker_upper or "DOGECOIN" in ticker_upper:
+            return "crypto"
+        elif "XRP" in ticker_upper:
+            return "crypto"
 
         return "unknown"
 

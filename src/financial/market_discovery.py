@@ -24,6 +24,8 @@ class AssetClass(Enum):
     EQUITY = "equity"       # SPX, NDX - H1000, H1200, H1600
     TREASURY = "treasury"   # 10Y - EOD only
     FOREX = "forex"         # EUR/USD, USD/JPY - "10" suffix
+    COMMODITY = "commodity" # WTI Crude Oil - EOD only
+    CRYPTO = "crypto"       # BTC, ETH, SOL, DOGE, XRP - 15min, hourly, daily
 
 
 @dataclass
@@ -86,6 +88,8 @@ class MarketDiscovery:
         AssetClass.EQUITY: ["H1000", "H1200", "H1600"],  # 10am, 12pm, 4pm EST
         AssetClass.TREASURY: [""],                        # EOD only
         AssetClass.FOREX: ["10"],                         # 10am EST (note: no "H" prefix)
+        AssetClass.COMMODITY: [""],                       # EOD only
+        AssetClass.CRYPTO: [""],                          # Dynamic — handled via client.py
     }
 
     # Series prefix to asset class mapping
@@ -101,6 +105,29 @@ class MarketDiscovery:
         # Forex
         "KXEURUSD": AssetClass.FOREX,
         "KXUSDJPY": AssetClass.FOREX,
+        # Commodity
+        "KXWTI": AssetClass.COMMODITY,
+        "KXWTIW": AssetClass.COMMODITY,
+        # Crypto — BTC
+        "KXBTC": AssetClass.CRYPTO,
+        "KXBTC15M": AssetClass.CRYPTO,
+        "KXBTCD": AssetClass.CRYPTO,
+        # Crypto — ETH
+        "KXETH": AssetClass.CRYPTO,
+        "KXETH15M": AssetClass.CRYPTO,
+        "KXETHD": AssetClass.CRYPTO,
+        # Crypto — SOL
+        "KXSOL": AssetClass.CRYPTO,
+        "KXSOL15M": AssetClass.CRYPTO,
+        "KXSOLD": AssetClass.CRYPTO,
+        # Crypto — DOGE
+        "KXDOGE": AssetClass.CRYPTO,
+        "KXDOGE15M": AssetClass.CRYPTO,
+        "KXDOGED": AssetClass.CRYPTO,
+        # Crypto — XRP
+        "KXXRP": AssetClass.CRYPTO,
+        "KXXRP15M": AssetClass.CRYPTO,
+        "KXXRPD": AssetClass.CRYPTO,
     }
 
     # Expiration times in EST (approximate)

@@ -59,6 +59,12 @@ class SophisticatedFairValue:
         "treasury10y": 0.15, # ~15% annualized vol for yields (in percentage point terms)
         "usdjpy": 0.08,      # Forex typically 8-12%
         "eurusd": 0.08,
+        "wti": 0.35,         # Crude oil ~35% annualized vol
+        "bitcoin": 0.55,     # BTC ~55% annualized vol
+        "ethereum": 0.70,    # ETH ~70% annualized vol
+        "solana": 0.80,      # SOL ~80% annualized vol
+        "dogecoin": 0.90,    # DOGE ~90% annualized vol
+        "xrp": 0.75,         # XRP ~75% annualized vol
     }
 
     # Asset class types (affects how we model price changes)
@@ -69,6 +75,12 @@ class SophisticatedFairValue:
         "treasury10y": "yield",  # Yields use absolute changes
         "usdjpy": "forex",
         "eurusd": "forex",
+        "wti": "commodity",
+        "bitcoin": "crypto",
+        "ethereum": "crypto",
+        "solana": "crypto",
+        "dogecoin": "crypto",
+        "xrp": "crypto",
     }
 
     # Overnight volatility multiplier (overnight moves are typically larger)
@@ -84,6 +96,8 @@ class SophisticatedFairValue:
         "futures": 23.0,    # Nearly 24-hour trading
         "forex": 24.0,      # 24-hour market
         "yield": 6.5,       # Similar to equity hours
+        "commodity": 23.0,  # Oil trades ~23h/day
+        "crypto": 24.0,     # 24/7 market
     }
 
     def __init__(self,
@@ -111,6 +125,7 @@ class SophisticatedFairValue:
         self.options_client = options_client
         self.options_implied_vols: dict = {}  # Cached implied vols
         self.options_skew = options_skew or {}
+        self.event_calendar = None  # EventCalendar instance for vol boost near FOMC/CPI
 
     def set_options_client(self, client):
         """Set options data client for implied volatility"""
@@ -375,11 +390,19 @@ class SophisticatedFairValue:
         effective_hours, vol_mult = self._get_effective_time(hours_to_expiry, close_time)
         vol *= vol_mult
 
+        # Apply event calendar vol boost (FOMC, CPI, etc.)
+        if self.event_calendar:
+            try:
+                event_vol_mult = self.event_calendar.get_volatility_multiplier()
+                vol *= event_vol_mult
+            except Exception:
+                pass  # Don't let calendar errors affect fair value
+
         # Convert to years using asset class-specific trading hours
         hours_per_day = self.TRADING_HOURS_PER_DAY.get(asset_class, 6.5)
 
-        if asset_class == "forex":
-            # Forex: 24-hour market, use actual hours
+        if asset_class in ("forex", "commodity", "crypto"):
+            # Forex/commodity/crypto: near 24-hour market, use actual hours
             time_years = hours_to_expiry / (24 * 365)
         else:
             # Equities, yields: use trading hours per day

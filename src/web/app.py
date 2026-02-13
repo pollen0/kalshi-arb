@@ -35,7 +35,6 @@ from src.financial.risk_manager import RiskManager, get_risk_manager
 from src.financial.options_data import OptionsDataClient, get_options_client
 from src.financial.event_calendar import EventCalendar, get_event_calendar, load_fomc_dates
 from src.financial.market_discovery import MarketDiscovery, MarketRollover, ExpirationSlot
-from src.sports.live_arb import LiveSportsArbitrage, LiveArbConfig, create_live_arb
 
 
 def create_app():
@@ -103,9 +102,6 @@ def create_app():
         "trading_paused": False,
         "thread_heartbeats": {},  # thread_name -> last heartbeat timestamp
         "trading_pause_reason": "",
-        # Live sports arbitrage
-        "live_sports_arb": None,
-        "live_sports_enabled": False,
     }
 
     # Orderbook analyzer
@@ -184,7 +180,8 @@ def create_app():
             # Initialize event calendar with FOMC dates
             state["event_calendar"] = EventCalendar()
             load_fomc_dates(state["event_calendar"])
-            print("[CALENDAR] Loaded economic event calendar")
+            state["fair_value_model"].event_calendar = state["event_calendar"]
+            print("[CALENDAR] Loaded economic event calendar (linked to FV model for vol boost)")
 
             # Initialize market discovery for finding all expiration slots
             state["market_discovery"] = MarketDiscovery(state["client"])
@@ -207,7 +204,7 @@ def create_app():
                 min_edge=_rc.financial_min_edge,
                 min_edge_to_keep=0.005,  # Cancel if edge < 0.5%
                 position_size=_rc.financial_position_size,
-                max_total_orders=20,        # Max 20 concurrent orders
+                max_total_orders=50,        # Max 50 concurrent orders
                 max_capital_pct=_rc.max_total_exposure,
                 price_buffer_cents=1,       # Place 1c below fair value
                 rebalance_threshold=0.01,   # Rebalance if fair value moves 1%
@@ -228,41 +225,6 @@ def create_app():
                 max_order_failures=8,
             )
             state["auto_trader"] = AutoTrader(state["client"], config)
-
-            # Initialize live sports arbitrage system (optional - requires ODDS_API_KEY)
-            ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "").strip()
-            if not ODDS_API_KEY:
-                try:
-                    from credentials import ODDS_API_KEY as _odds_key
-                    ODDS_API_KEY = _odds_key
-                except ImportError:
-                    pass
-            try:
-                if ODDS_API_KEY and ODDS_API_KEY != "your-odds-api-key-here":
-                    from src.core.config import get_risk_config
-                    _rc = get_risk_config()
-                    arb_config = LiveArbConfig(
-                        min_edge=_rc.sports_min_edge,
-                        max_bet_size=_rc.sports_position_size,
-                        max_exposure_per_game=100.0,  # Max $100 per game
-                        max_total_exposure=500.0,     # Dynamic — overridden by _check_portfolio_risk
-                        stale_data_seconds=30,   # Reject stale odds
-                        dry_run=True,            # Start in dry run mode
-                        poll_interval_seconds=10.0,
-                    )
-                    state["live_sports_arb"] = LiveSportsArbitrage(
-                        state["client"],
-                        ODDS_API_KEY,
-                        arb_config
-                    )
-                    # Auto-start scanning in background (runs in dry-run mode by default)
-                    state["live_sports_arb"].start()
-                    state["live_sports_enabled"] = True
-                    print("[SPORTS] Live sports arbitrage system initialized and scanning (dry run mode)")
-                else:
-                    print("[SPORTS] ODDS_API_KEY not configured - sports arbitrage disabled")
-            except Exception as sports_err:
-                print(f"[SPORTS] Error initializing sports arbitrage: {sports_err}")
 
             return True
         except Exception as e:
@@ -449,7 +411,7 @@ def create_app():
             # Update Treasury 10Y markets (KXTNOTED)
             try:
                 # Always fetch markets from Kalshi, regardless of quote availability
-                tnote_markets = state["client"].get_markets(series_ticker="KXTNOTED", status="active")
+                tnote_markets = state["client"].get_markets_by_series_prefix("KXTNOTED", status="active")
                 treasury_markets = []
 
                 # Try to get treasury quote (with Yahoo Finance fallback via get_quote)
@@ -529,7 +491,7 @@ def create_app():
                     usdjpy_price = usdjpy_quote.price
 
                     usdjpy_markets = []
-                    jpy_markets = state["client"].get_markets(series_ticker="KXUSDJPY", status="active")
+                    jpy_markets = state["client"].get_markets_by_series_prefix("KXUSDJPY", status="active")
                     for m in (jpy_markets or []):
                         hours = hours_until(m.close_time)
                         if hours and hours > 0:
@@ -561,7 +523,7 @@ def create_app():
                     eurusd_price = eurusd_quote.price
 
                     eurusd_markets = []
-                    eur_markets = state["client"].get_markets(series_ticker="KXEURUSD", status="active")
+                    eur_markets = state["client"].get_markets_by_series_prefix("KXEURUSD", status="active")
                     for m in (eur_markets or []):
                         hours = hours_until(m.close_time)
                         if hours and hours > 0:
@@ -586,10 +548,118 @@ def create_app():
             except Exception as e:
                 print(f"[MARKETS] Error fetching EUR/USD: {e}")
 
+            # Update WTI Crude Oil markets (KXWTI daily + KXWTIW weekly)
+            try:
+                wti_quote = state["futures_quotes"].get("wti")
+                if not wti_quote or not wti_quote.price:
+                    fallback_quote = state["futures"].get_quote("wti")
+                    if fallback_quote and fallback_quote.price:
+                        wti_quote = fallback_quote
+
+                wti_price = wti_quote.price if wti_quote else None
+
+                wti_markets = []
+                # Fetch daily and weekly WTI markets
+                for series in ["KXWTI", "KXWTIW"]:
+                    raw = state["client"].get_markets_by_series_prefix(series, status="active")
+                    for m in (raw or []):
+                        hours = hours_until(m.close_time)
+                        if hours and hours > 0:
+                            if wti_price and m.lower_bound is not None:
+                                if m.upper_bound is not None and m.upper_bound != float('inf'):
+                                    fv_result = fv_model.calculate(
+                                        current_price=wti_price,
+                                        lower_bound=m.lower_bound,
+                                        upper_bound=m.upper_bound,
+                                        hours_to_expiry=hours,
+                                        index="wti",
+                                        close_time=m.close_time,
+                                    )
+                                elif m.upper_bound is None or m.upper_bound == float('inf'):
+                                    fv_result = fv_model.calculate(
+                                        current_price=wti_price,
+                                        lower_bound=m.lower_bound,
+                                        upper_bound=float('inf'),
+                                        hours_to_expiry=hours,
+                                        index="wti",
+                                        close_time=m.close_time,
+                                    )
+                                else:
+                                    continue
+                                m.fair_value = fv_result.probability
+                                m.fair_value_time = datetime.now(timezone.utc)
+                                m.model_source = f"WTI=${wti_price:.2f}"
+                            wti_markets.append(m)
+
+                state["markets"]["wti"] = sorted(wti_markets, key=lambda x: x.lower_bound or 0)
+                if wti_markets:
+                    price_str = f", price=${wti_price:.2f}" if wti_price else " (no quote)"
+                    print(f"[MARKETS] Loaded {len(wti_markets)} WTI markets{price_str}")
+            except Exception as e:
+                print(f"[MARKETS] Error fetching WTI: {e}")
+
+            # Update Crypto markets (BTC, ETH, SOL, DOGE, XRP — each with 15min, hourly, daily)
+            CRYPTO_COINS = {
+                "bitcoin": {"series": ["KXBTC", "KXBTC15M", "KXBTCD"], "label": "BTC"},
+                "ethereum": {"series": ["KXETH", "KXETH15M", "KXETHD"], "label": "ETH"},
+                "solana": {"series": ["KXSOL", "KXSOL15M", "KXSOLD"], "label": "SOL"},
+                "dogecoin": {"series": ["KXDOGE", "KXDOGE15M", "KXDOGED"], "label": "DOGE"},
+                "xrp": {"series": ["KXXRP", "KXXRP15M", "KXXRPD"], "label": "XRP"},
+            }
+            for coin_key, coin_info in CRYPTO_COINS.items():
+                try:
+                    coin_quote = state["futures_quotes"].get(coin_key)
+                    if not coin_quote or not coin_quote.price:
+                        fallback = state["futures"].get_quote(coin_key)
+                        if fallback and fallback.price:
+                            coin_quote = fallback
+
+                    coin_price = coin_quote.price if coin_quote else None
+                    coin_markets = []
+
+                    for series in coin_info["series"]:
+                        raw = state["client"].get_markets_by_series_prefix(series, status="active")
+                        for m in (raw or []):
+                            hours = hours_until(m.close_time)
+                            if hours and hours > 0:
+                                if coin_price and m.lower_bound is not None:
+                                    if m.upper_bound is not None and m.upper_bound != float('inf'):
+                                        fv_result = fv_model.calculate(
+                                            current_price=coin_price,
+                                            lower_bound=m.lower_bound,
+                                            upper_bound=m.upper_bound,
+                                            hours_to_expiry=hours,
+                                            index=coin_key,
+                                            close_time=m.close_time,
+                                        )
+                                    elif m.upper_bound is None or m.upper_bound == float('inf'):
+                                        fv_result = fv_model.calculate(
+                                            current_price=coin_price,
+                                            lower_bound=m.lower_bound,
+                                            upper_bound=float('inf'),
+                                            hours_to_expiry=hours,
+                                            index=coin_key,
+                                            close_time=m.close_time,
+                                        )
+                                    else:
+                                        continue
+                                    m.fair_value = fv_result.probability
+                                    m.fair_value_time = datetime.now(timezone.utc)
+                                    m.model_source = f"{coin_info['label']}=${coin_price:,.2f}"
+                                coin_markets.append(m)
+
+                    state["markets"][coin_key] = sorted(coin_markets, key=lambda x: x.lower_bound or 0)
+                    if coin_markets:
+                        price_str = f", price=${coin_price:,.2f}" if coin_price else " (no quote)"
+                        print(f"[MARKETS] Loaded {len(coin_markets)} {coin_info['label']} markets{price_str}")
+                except Exception as e:
+                    print(f"[MARKETS] Error fetching {coin_info['label']}: {e}")
+
             # Update position prices
             for pos in state["positions"]:
                 # Find matching market in all market types
-                for key in ["nasdaq_above", "nasdaq_range", "spx_above", "spx_range", "treasury", "usdjpy", "eurusd"]:
+                for key in ["nasdaq_above", "nasdaq_range", "spx_above", "spx_range", "treasury", "usdjpy", "eurusd", "wti",
+                            "bitcoin", "ethereum", "solana", "dogecoin", "xrp"]:
                     for m in state["markets"].get(key, []):
                         if m.ticker == pos.ticker:
                             pos.current_bid = m.yes_bid / 100 if m.yes_bid else None
@@ -605,7 +675,13 @@ def create_app():
                 state["markets"].get("spx_range", []) +
                 state["markets"].get("treasury", []) +
                 state["markets"].get("usdjpy", []) +
-                state["markets"].get("eurusd", [])
+                state["markets"].get("eurusd", []) +
+                state["markets"].get("wti", []) +
+                state["markets"].get("bitcoin", []) +
+                state["markets"].get("ethereum", []) +
+                state["markets"].get("solana", []) +
+                state["markets"].get("dogecoin", []) +
+                state["markets"].get("xrp", [])
             )
             markets_with_edge = sorted(
                 [m for m in all_markets if m.best_edge and m.best_edge >= 0.02],
@@ -799,7 +875,15 @@ def create_app():
                         state["markets"].get("nasdaq_range", []) +
                         state["markets"].get("spx_above", []) +
                         state["markets"].get("spx_range", []) +
-                        state["markets"].get("treasury", [])
+                        state["markets"].get("treasury", []) +
+                        state["markets"].get("usdjpy", []) +
+                        state["markets"].get("eurusd", []) +
+                        state["markets"].get("wti", []) +
+                        state["markets"].get("bitcoin", []) +
+                        state["markets"].get("ethereum", []) +
+                        state["markets"].get("solana", []) +
+                        state["markets"].get("dogecoin", []) +
+                        state["markets"].get("xrp", [])
                     )
                     markets_with_edge = sorted(
                         [m for m in all_markets if m.best_edge and m.best_edge >= 0.02],
@@ -831,7 +915,15 @@ def create_app():
                     state["markets"].get("nasdaq_range", []) +
                     state["markets"].get("spx_above", []) +
                     state["markets"].get("spx_range", []) +
-                    state["markets"].get("treasury", [])
+                    state["markets"].get("treasury", []) +
+                    state["markets"].get("usdjpy", []) +
+                    state["markets"].get("eurusd", []) +
+                    state["markets"].get("wti", []) +
+                    state["markets"].get("bitcoin", []) +
+                    state["markets"].get("ethereum", []) +
+                    state["markets"].get("solana", []) +
+                    state["markets"].get("dogecoin", []) +
+                    state["markets"].get("xrp", [])
                 )
                 if all_markets:
                     plan = strategy.generate_orders(all_markets)
@@ -848,15 +940,25 @@ def create_app():
             try:
                 if state["auto_trading_enabled"] and state["auto_trader"]:
                     # CRITICAL: Check if trading is paused (economic events, etc.)
+                    # If trade_through_events is enabled, skip the pause (vol boost handles risk)
                     if state.get("trading_paused"):
-                        reason = state.get("trading_pause_reason", "Unknown")
-                        # Only log occasionally to avoid spam
-                        if not hasattr(auto_trading_loop, '_last_pause_log') or \
-                           time.time() - auto_trading_loop._last_pause_log > 60:
-                            print(f"[AUTO-TRADE] Paused: {reason}")
-                            auto_trading_loop._last_pause_log = time.time()
-                        time.sleep(1)
-                        continue
+                        trader = state["auto_trader"]
+                        if trader and trader.config.trade_through_events:
+                            # Trading through event — vol boost in FV model handles the risk
+                            if not hasattr(auto_trading_loop, '_last_event_log') or \
+                               time.time() - auto_trading_loop._last_event_log > 60:
+                                reason = state.get("trading_pause_reason", "Unknown")
+                                print(f"[AUTO-TRADE] Trading through event (vol-boosted): {reason}")
+                                auto_trading_loop._last_event_log = time.time()
+                        else:
+                            reason = state.get("trading_pause_reason", "Unknown")
+                            # Only log occasionally to avoid spam
+                            if not hasattr(auto_trading_loop, '_last_pause_log') or \
+                               time.time() - auto_trading_loop._last_pause_log > 60:
+                                print(f"[AUTO-TRADE] Paused: {reason}")
+                                auto_trading_loop._last_pause_log = time.time()
+                            time.sleep(1)
+                            continue
 
                     all_markets = (
                         state["markets"].get("nasdaq_above", []) +
@@ -865,7 +967,13 @@ def create_app():
                         state["markets"].get("spx_range", []) +
                         state["markets"].get("treasury", []) +
                         state["markets"].get("usdjpy", []) +
-                        state["markets"].get("eurusd", [])
+                        state["markets"].get("eurusd", []) +
+                        state["markets"].get("wti", []) +
+                        state["markets"].get("bitcoin", []) +
+                        state["markets"].get("ethereum", []) +
+                        state["markets"].get("solana", []) +
+                        state["markets"].get("dogecoin", []) +
+                        state["markets"].get("xrp", [])
                     )
                     # Only trade if we have fresh futures data (sanity check)
                     futures_ok = False
@@ -874,6 +982,7 @@ def create_app():
                     t10y = state["futures_quotes"].get("treasury10y")
                     usdjpy = state["futures_quotes"].get("usdjpy")
                     eurusd = state["futures_quotes"].get("eurusd")
+                    wti = state["futures_quotes"].get("wti")
                     if nq and nq.price > 10000:  # NQ should be ~21000+
                         futures_ok = True
                     if es and es.price > 3000:   # ES should be ~6000+
@@ -883,6 +992,11 @@ def create_app():
                     if usdjpy and usdjpy.price > 100:  # USD/JPY should be ~150+
                         futures_ok = True
                     if eurusd and eurusd.price > 0.5:  # EUR/USD should be ~1.0+
+                        futures_ok = True
+                    if wti and wti.price > 20:  # WTI should be ~$60+
+                        futures_ok = True
+                    btc = state["futures_quotes"].get("bitcoin")
+                    if btc and btc.price > 1000:  # BTC should be ~$90000+
                         futures_ok = True
 
                     # Check thread heartbeats — halt if critical threads are dead
@@ -896,6 +1010,9 @@ def create_app():
                             break
 
                     if all_markets and futures_ok:
+                        # Pass VIX price for dynamic order scaling
+                        if state.get("vix_price"):
+                            state["auto_trader"]._vix_price = state["vix_price"]
                         state["auto_trader"].trading_loop(all_markets)
                     elif not futures_ok:
                         print("[AUTO-TRADE] Waiting for valid futures data...")
@@ -954,46 +1071,77 @@ def create_app():
             })
 
         # Format markets
-        def format_markets(markets, futures_price, is_yield_based=False, is_forex=False, forex_decimals=3):
+        def format_markets(markets, futures_price, is_yield_based=False, is_forex=False, forex_decimals=3, is_commodity=False, is_crypto=False):
             result = []
             for m in markets:
-                if m.lower_bound is None:
-                    continue
+                # Handle missing bounds: "below" markets have lower_bound=None, upper_bound set
+                lower = m.lower_bound
+                upper = m.upper_bound
+                if lower is None and upper is not None:
+                    lower = 0  # "below" market
+                elif lower is None:
+                    continue   # truly no bounds — skip
 
                 # Format range (handle above/below markets where upper_bound is None or inf)
                 if is_yield_based:
                     # Treasury yields: format as percentage (e.g., "4.50%+" or "4.50-4.55%")
-                    if m.upper_bound is None or m.upper_bound == float('inf'):
-                        range_str = f"{m.lower_bound:.2f}%+"
-                    elif m.lower_bound <= 0:
-                        range_str = f"<{m.upper_bound:.2f}%"
+                    if upper is None or upper == float('inf'):
+                        range_str = f"{lower:.2f}%+"
+                    elif lower <= 0:
+                        range_str = f"<{upper:.2f}%"
                     else:
-                        range_str = f"{m.lower_bound:.2f}-{m.upper_bound:.2f}%"
+                        range_str = f"{lower:.2f}-{upper:.2f}%"
                 elif is_forex:
                     # Forex: format with appropriate decimals (e.g., "156.500-156.749" for JPY, "1.18200-1.18399" for EUR)
                     fmt = f"{{:.{forex_decimals}f}}"
-                    if m.upper_bound is None or m.upper_bound == float('inf'):
-                        range_str = fmt.format(m.lower_bound) + "+"
-                    elif m.lower_bound <= 0:
-                        range_str = "<" + fmt.format(m.upper_bound)
+                    if upper is None or upper == float('inf'):
+                        range_str = fmt.format(lower) + "+"
+                    elif lower <= 0:
+                        range_str = "<" + fmt.format(upper)
                     else:
-                        range_str = fmt.format(m.lower_bound) + "-" + fmt.format(m.upper_bound)
+                        range_str = fmt.format(lower) + "-" + fmt.format(upper)
+                elif is_commodity:
+                    # Commodity (oil): format as dollar prices with 2 decimals
+                    if upper is None or upper == float('inf'):
+                        range_str = f"${lower:.2f}+"
+                    elif lower <= 0:
+                        range_str = f"<${upper:.2f}"
+                    else:
+                        range_str = f"${lower:.2f}-{upper:.2f}"
+                elif is_crypto:
+                    # Crypto: format as dollar prices (BTC uses commas, small coins use decimals)
+                    if lower >= 100:
+                        # Large values (BTC, ETH): use commas, no decimals
+                        if upper is None or upper == float('inf'):
+                            range_str = f"${lower:,.0f}+"
+                        elif lower <= 0:
+                            range_str = f"<${upper:,.0f}"
+                        else:
+                            range_str = f"${lower:,.0f}-{upper:,.0f}"
+                    else:
+                        # Small values (DOGE, XRP, SOL): use decimals
+                        if upper is None or upper == float('inf'):
+                            range_str = f"${lower:.4f}+"
+                        elif lower <= 0:
+                            range_str = f"<${upper:.4f}"
+                        else:
+                            range_str = f"${lower:.4f}-{upper:.4f}"
                 else:
                     # Equity indices: format as large integers
-                    if m.upper_bound is None or m.upper_bound == float('inf'):
-                        range_str = f"{m.lower_bound:,.0f}+"
-                    elif m.lower_bound <= 0:
-                        range_str = f"<{m.upper_bound:,.0f}"
+                    if upper is None or upper == float('inf'):
+                        range_str = f"{lower:,.0f}+"
+                    elif lower <= 0:
+                        range_str = f"<{upper:,.0f}"
                     else:
-                        range_str = f"{m.lower_bound:,.0f}-{m.upper_bound:,.0f}"
+                        range_str = f"{lower:,.0f}-{upper:,.0f}"
 
                 # Calculate distance from current price
                 if futures_price:
-                    if m.upper_bound is None or m.upper_bound == float('inf'):
+                    if upper is None or upper == float('inf'):
                         # For above markets, use lower_bound as the reference
-                        distance = m.lower_bound - futures_price
+                        distance = lower - futures_price
                     else:
-                        mid = (m.lower_bound + m.upper_bound) / 2
+                        mid = (lower + upper) / 2
                         distance = mid - futures_price
                 else:
                     distance = 0
@@ -1070,6 +1218,12 @@ def create_app():
         t10y = state["futures_quotes"].get("treasury10y")
         usdjpy = state["futures_quotes"].get("usdjpy")
         eurusd = state["futures_quotes"].get("eurusd")
+        wti = state["futures_quotes"].get("wti")
+        btc = state["futures_quotes"].get("bitcoin")
+        eth = state["futures_quotes"].get("ethereum")
+        sol = state["futures_quotes"].get("solana")
+        doge = state["futures_quotes"].get("dogecoin")
+        xrp = state["futures_quotes"].get("xrp")
 
         return jsonify({
             "balance": state["balance"],
@@ -1115,6 +1269,54 @@ def create_app():
                     "change_pct": eurusd.change_pct if eurusd else None,
                 },
                 "markets": format_markets(state["markets"].get("eurusd", []), eurusd.price if eurusd else None, is_forex=True, forex_decimals=5),
+            },
+            "wti": {
+                "quote": {
+                    "price": wti.price if wti else None,
+                    "change": wti.change if wti else None,
+                    "change_pct": wti.change_pct if wti else None,
+                },
+                "markets": format_markets(state["markets"].get("wti", []), wti.price if wti else None, is_commodity=True),
+            },
+            "bitcoin": {
+                "quote": {
+                    "price": btc.price if btc else None,
+                    "change": btc.change if btc else None,
+                    "change_pct": btc.change_pct if btc else None,
+                },
+                "markets": format_markets(state["markets"].get("bitcoin", []), btc.price if btc else None, is_crypto=True),
+            },
+            "ethereum": {
+                "quote": {
+                    "price": eth.price if eth else None,
+                    "change": eth.change if eth else None,
+                    "change_pct": eth.change_pct if eth else None,
+                },
+                "markets": format_markets(state["markets"].get("ethereum", []), eth.price if eth else None, is_crypto=True),
+            },
+            "solana": {
+                "quote": {
+                    "price": sol.price if sol else None,
+                    "change": sol.change if sol else None,
+                    "change_pct": sol.change_pct if sol else None,
+                },
+                "markets": format_markets(state["markets"].get("solana", []), sol.price if sol else None, is_crypto=True),
+            },
+            "dogecoin": {
+                "quote": {
+                    "price": doge.price if doge else None,
+                    "change": doge.change if doge else None,
+                    "change_pct": doge.change_pct if doge else None,
+                },
+                "markets": format_markets(state["markets"].get("dogecoin", []), doge.price if doge else None, is_crypto=True),
+            },
+            "xrp": {
+                "quote": {
+                    "price": xrp.price if xrp else None,
+                    "change": xrp.change if xrp else None,
+                    "change_pct": xrp.change_pct if xrp else None,
+                },
+                "markets": format_markets(state["markets"].get("xrp", []), xrp.price if xrp else None, is_crypto=True),
             },
             "last_update": state["last_update"].isoformat() if state["last_update"] else None,
             "last_futures_update": state["last_futures_update"].isoformat() if state["last_futures_update"] else None,
@@ -1464,9 +1666,7 @@ def create_app():
                 "max_drawdown_pct": (0.05, 0.30),          # 5%-30%
                 "max_total_exposure": (0.10, 1.0),          # 10%-100%
                 "financial_min_edge": (0.005, 0.20),        # 0.5%-20%
-                "sports_min_edge": (0.01, 0.30),            # 1%-30%
                 "financial_position_size": (1, 200),
-                "sports_position_size": (1, 200),
                 "max_total_orders": (5, 200),
             }
             for key, (lo, hi) in _BOUNDS.items():
@@ -1488,11 +1688,6 @@ def create_app():
                 rc.financial_min_edge = float(data["financial_min_edge"])
             if "financial_position_size" in data:
                 rc.financial_position_size = int(data["financial_position_size"])
-            if "sports_min_edge" in data:
-                rc.sports_min_edge = float(data["sports_min_edge"])
-            if "sports_position_size" in data:
-                rc.sports_position_size = int(data["sports_position_size"])
-
             # Handle max_total_orders (lives on TraderConfig, not RiskConfig)
             if "max_total_orders" in data:
                 max_orders_val = int(data["max_total_orders"])
@@ -1509,11 +1704,6 @@ def create_app():
                 trader.config.max_capital_pct = rc.max_total_exposure
                 trader._max_drawdown_pct = rc.max_drawdown_pct
 
-            arb = state.get("live_sports_arb")
-            if arb:
-                arb.config.min_edge = rc.sports_min_edge
-                arb.config.max_bet_size = rc.sports_position_size
-
             # Persist to disk
             save_config()
 
@@ -1525,8 +1715,6 @@ def create_app():
             "financial_min_edge": rc.financial_min_edge,
             "financial_position_size": rc.financial_position_size,
             "max_total_orders": trader.config.max_total_orders if trader else 20,
-            "sports_min_edge": rc.sports_min_edge,
-            "sports_position_size": rc.sports_position_size,
         })
 
     @app.route('/api/auto-trader/cancel-all', methods=['POST'])
@@ -1710,215 +1898,6 @@ def create_app():
                 "hold_recommendations": len(holds),
                 "total_unrealized_pnl": total_unrealized,
             }
-        })
-
-    # =========================================================================
-    # LIVE SPORTS ARBITRAGE API
-    # =========================================================================
-
-    @app.route('/api/sports/status')
-    def api_sports_status():
-        """Get live sports arbitrage status"""
-        arb = state.get("live_sports_arb")
-        if not arb:
-            return jsonify({
-                "enabled": False,
-                "error": "Sports arbitrage not configured (missing ODDS_API_KEY)",
-            })
-
-        return jsonify(arb.get_status())
-
-    @app.route('/api/sports/start', methods=['POST'])
-    @require_auth
-    def api_sports_start():
-        """Start live sports arbitrage monitoring"""
-        arb = state.get("live_sports_arb")
-        if not arb:
-            return jsonify({"error": "Sports arbitrage not configured"}), 400
-
-        arb.start()
-        state["live_sports_enabled"] = True
-        return jsonify({"success": True, "running": arb._running})
-
-    @app.route('/api/sports/stop', methods=['POST'])
-    @require_auth
-    def api_sports_stop():
-        """Stop live sports arbitrage monitoring"""
-        arb = state.get("live_sports_arb")
-        if not arb:
-            return jsonify({"error": "Sports arbitrage not configured"}), 400
-
-        arb.stop()
-        state["live_sports_enabled"] = False
-        return jsonify({"success": True, "running": arb._running})
-
-    @app.route('/api/sports/scan', methods=['POST'])
-    @require_auth
-    def api_sports_scan():
-        """Run one scan cycle manually"""
-        arb = state.get("live_sports_arb")
-        if not arb:
-            return jsonify({"error": "Sports arbitrage not configured"}), 400
-
-        try:
-            opportunities = arb.scan_once()
-            games = arb.get_live_games()
-            return jsonify({
-                "success": True,
-                "games_found": len(games),
-                "opportunities_found": len(opportunities),
-                "games": [
-                    {
-                        "event_ticker": g.kalshi_event_ticker,
-                        "display_name": g.display_name,
-                        "sport": g.sport.value,
-                        "is_live": g.is_live,
-                        "markets_count": len(g.kalshi_markets),
-                        "odds_age": g.odds_age_seconds,
-                        "matched": g.odds_api_event_id != "",
-                    }
-                    for g in games
-                ],
-                "opportunities": [
-                    {
-                        "ticker": o.kalshi_ticker,
-                        "title": o.kalshi_title,
-                        "side": o.bet_side.value,
-                        "edge_pct": o.edge_pct,
-                        "kalshi_price": o.kalshi_price,
-                        "fair_value": o.fair_value,
-                        "best_book": o.best_book,
-                        "num_books": o.num_books,
-                        "is_stale": o.is_stale,
-                    }
-                    for o in opportunities[:10]
-                ],
-            })
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            return jsonify({"error": str(e)}), 500
-
-    @app.route('/api/sports/config', methods=['GET', 'POST'])
-    @require_auth
-    def api_sports_config():
-        """Get or update sports arbitrage config"""
-        arb = state.get("live_sports_arb")
-        if not arb:
-            return jsonify({"error": "Sports arbitrage not configured"}), 400
-
-        if request.method == 'POST':
-            data = request.json or {}
-
-            # Update config values
-            if "min_edge" in data:
-                arb.config.min_edge = float(data["min_edge"])
-            if "max_bet_size" in data:
-                arb.config.max_bet_size = int(data["max_bet_size"])
-            if "max_exposure_per_game" in data:
-                arb.config.max_exposure_per_game = float(data["max_exposure_per_game"])
-            if "max_total_exposure" in data:
-                arb.config.max_total_exposure = float(data["max_total_exposure"])
-            if "dry_run" in data:
-                arb.config.dry_run = bool(data["dry_run"])
-            if "stale_data_seconds" in data:
-                arb.config.stale_data_seconds = int(data["stale_data_seconds"])
-            if "min_books_for_consensus" in data:
-                arb.config.min_books_for_consensus = int(data["min_books_for_consensus"])
-
-        return jsonify({
-            "min_edge": arb.config.min_edge,
-            "min_edge_pct": arb.config.min_edge * 100,
-            "max_bet_size": arb.config.max_bet_size,
-            "max_exposure_per_game": arb.config.max_exposure_per_game,
-            "max_total_exposure": arb.config.max_total_exposure,
-            "stale_data_seconds": arb.config.stale_data_seconds,
-            "min_books_for_consensus": arb.config.min_books_for_consensus,
-            "dry_run": arb.config.dry_run,
-        })
-
-    @app.route('/api/sports/games')
-    def api_sports_games():
-        """Get all tracked live games"""
-        arb = state.get("live_sports_arb")
-        if not arb:
-            return jsonify({"error": "Sports arbitrage not configured"}), 400
-
-        games = arb.get_live_games()
-        return jsonify({
-            "games": [
-                {
-                    "event_ticker": g.kalshi_event_ticker,
-                    "display_name": g.display_name,
-                    "sport": g.sport.value,
-                    "home_team": g.home_team,
-                    "away_team": g.away_team,
-                    "is_live": g.is_live,
-                    "game_state": g.game_state.value,
-                    "home_score": g.home_score,
-                    "away_score": g.away_score,
-                    "markets_count": len(g.kalshi_markets),
-                    "odds_matched": g.odds_api_event_id != "",
-                    "odds_age_seconds": g.odds_age_seconds,
-                }
-                for g in games
-            ],
-            "count": len(games),
-        })
-
-    @app.route('/api/sports/opportunities')
-    def api_sports_opportunities():
-        """Get current arbitrage opportunities"""
-        arb = state.get("live_sports_arb")
-        if not arb:
-            return jsonify({"error": "Sports arbitrage not configured"}), 400
-
-        opportunities = arb.get_opportunities()
-        return jsonify({
-            "opportunities": [
-                {
-                    "ticker": o.kalshi_ticker,
-                    "title": o.kalshi_title,
-                    "side": o.bet_side.value,
-                    "edge": o.edge,
-                    "edge_pct": o.edge_pct,
-                    "kalshi_price": o.kalshi_price,
-                    "fair_value": o.fair_value,
-                    "best_book": o.best_book,
-                    "best_odds": o.best_odds,
-                    "num_books": o.num_books,
-                    "is_stale": o.is_stale,
-                    "confidence": o.confidence,
-                    "game": o.game.display_name,
-                }
-                for o in opportunities
-            ],
-            "count": len(opportunities),
-        })
-
-    @app.route('/api/sports/bets')
-    def api_sports_bets():
-        """Get recent bet history"""
-        arb = state.get("live_sports_arb")
-        if not arb:
-            return jsonify({"error": "Sports arbitrage not configured"}), 400
-
-        return jsonify({
-            "bets": [
-                {
-                    "ticker": b.opportunity.kalshi_ticker,
-                    "game": b.opportunity.game.display_name,
-                    "side": b.side.value,
-                    "size": b.size,
-                    "price": b.price,
-                    "edge_pct": b.opportunity.edge_pct,
-                    "status": b.status,
-                    "order_id": b.order_id,
-                    "placed_at": b.placed_at.isoformat(),
-                }
-                for b in list(arb._bet_history)
-            ],
-            "count": len(arb._bet_history),
         })
 
     return app
@@ -2775,7 +2754,12 @@ DASHBOARD_HTML = '''
             <button class="tab" data-tab="treasury">10Y Treasury</button>
             <button class="tab" data-tab="usdjpy">USD/JPY</button>
             <button class="tab" data-tab="eurusd">EUR/USD</button>
-            <button class="tab" data-tab="sports">Sports</button>
+            <button class="tab" data-tab="wti">WTI Oil</button>
+            <button class="tab" data-tab="bitcoin">BTC</button>
+            <button class="tab" data-tab="ethereum">ETH</button>
+            <button class="tab" data-tab="solana">SOL</button>
+            <button class="tab" data-tab="dogecoin">DOGE</button>
+            <button class="tab" data-tab="xrp">XRP</button>
         </div>
 
         <!-- Positions Section -->
@@ -2831,38 +2815,6 @@ DASHBOARD_HTML = '''
                     <button id="dry-run-toggle" onclick="toggleDryRun()" style="margin-left: 8px; padding: 8px 12px; border-radius: 4px; border: none; cursor: pointer;">DRY RUN</button>
                     <button id="reset-halt-btn" onclick="resetHalt()" style="display:none; margin-left: 8px; padding: 8px 12px; border-radius: 4px; border: none; cursor: pointer; background: var(--red); color: white;">Reset Halt</button>
                 </div>
-                <!-- Sports stats row -->
-                <div style="border-top: 1px solid var(--border); margin-top: 12px; padding-top: 12px;">
-                    <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px;">
-                        <div class="status-indicator" id="sports-status-light"></div>
-                        <span style="font-size: 12px; font-weight: 500;" id="sports-status-text">Not Configured</span>
-                        <span id="sports-mode-badge" style="padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 600;">DRY RUN</span>
-                        <span style="font-size: 11px; color: var(--text-3); margin-left: auto;">Sports</span>
-                        <button id="sports-dry-toggle" onclick="toggleSportsDryRun()" style="padding: 4px 10px; border-radius: 4px; border: none; cursor: pointer; font-size: 11px;">DRY RUN</button>
-                    </div>
-                    <div class="auto-trader-stats">
-                        <div class="trading-stat">
-                            <span class="label">Live Games</span>
-                            <span class="value" id="sports-game-count">0</span>
-                        </div>
-                        <div class="trading-stat">
-                            <span class="label">Opportunities</span>
-                            <span class="value" id="sports-opp-count">0</span>
-                        </div>
-                        <div class="trading-stat">
-                            <span class="label">Bets Placed</span>
-                            <span class="value" id="sports-bet-count">0</span>
-                        </div>
-                        <div class="trading-stat">
-                            <span class="label">Exposure</span>
-                            <span class="value" id="sports-exposure">$0</span>
-                        </div>
-                        <div class="trading-stat">
-                            <span class="label">P&L</span>
-                            <span class="value" id="sports-pnl">$0</span>
-                        </div>
-                    </div>
-                </div>
             </div>
 
             <!-- Fill Probability Stats -->
@@ -2892,7 +2844,7 @@ DASHBOARD_HTML = '''
             <!-- Unified Trading Config Panel -->
             <div class="config-panel">
                 <h4>Trading Config</h4>
-                <div style="font-size: 11px; color: var(--text-3); margin-bottom: 12px;">Shared risk — applies to financial + sports</div>
+                <div style="font-size: 11px; color: var(--text-3); margin-bottom: 12px;">Risk management</div>
                 <div class="config-grid">
                     <div class="config-item">
                         <label>Daily Loss Limit</label>
@@ -2921,14 +2873,6 @@ DASHBOARD_HTML = '''
                         <label>Max Orders</label>
                         <input type="number" id="cfg-max-orders" value="20" step="5" min="5" max="200">
                     </div>
-                    <div class="config-item">
-                        <label>Sports Min Edge</label>
-                        <input type="number" id="cfg-sports-min-edge" value="5" step="0.5" min="1" max="20"> %
-                    </div>
-                    <div class="config-item">
-                        <label>Sports Bet Size</label>
-                        <input type="number" id="cfg-sports-bet-size" value="20" step="5" min="1" max="100">
-                    </div>
                 </div>
                 <button class="save-config-btn" onclick="saveConfig()">Save Config</button>
             </div>
@@ -2953,7 +2897,6 @@ DASHBOARD_HTML = '''
                 </table>
             </div>
 
-            <!-- Sports config and controls are merged into the auto-trader panel above -->
         </section>
 
         <!-- NASDAQ Above Section -->
@@ -3138,87 +3081,107 @@ DASHBOARD_HTML = '''
             </div>
         </section>
 
-        <!-- Sports Arbitrage Section -->
-        <section class="section" id="section-sports">
-            <!-- Read-only status bar -->
-            <div style="display: flex; align-items: center; gap: 16px; padding: 10px 16px; background: var(--bg-1); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 16px; flex-wrap: wrap;">
-                <div style="display: flex; align-items: center; gap: 6px;">
-                    <div class="status-indicator" id="sports-status-light-ro"></div>
-                    <span id="sports-status-text-ro" style="font-weight: 500;">Stopped</span>
-                </div>
-                <span id="sports-mode-badge-ro" style="padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;">DRY RUN</span>
-                <span style="color: var(--text-3);">|</span>
-                <span style="font-size: 12px; color: var(--text-2);"><span id="sports-game-count-ro">0</span> games</span>
-                <span style="font-size: 12px; color: var(--text-2);"><span id="sports-opp-count-ro">0</span> opps</span>
-                <span style="font-size: 12px; color: var(--text-2);"><span id="sports-bet-count-ro">0</span> bets</span>
-                <span style="margin-left: auto; font-size: 11px; color: var(--text-3);">Configure in Trading Plan tab</span>
+        <!-- WTI Crude Oil Section -->
+        <section class="section" id="section-wti">
+            <div class="futures-badge">
+                <span style="color: var(--text-3)">WTI Crude:</span>
+                <span class="price" id="wti-price">-</span>
+                <span class="change" id="wti-change">-</span>
             </div>
 
-            <!-- Live Games -->
-            <div class="section-title">Live Games <span class="badge" id="games-badge">0</span></div>
-            <div class="table-container" id="sports-games-container">
+            <div class="table-container">
                 <table>
                     <thead>
                         <tr>
-                            <th>Sport</th>
-                            <th>Game</th>
-                            <th>Status</th>
-                            <th>Kalshi Markets</th>
-                            <th class="text-right">Best Edge</th>
-                        </tr>
-                    </thead>
-                    <tbody id="sports-games-table">
-                        <tr><td colspan="5" class="empty" style="padding: 40px; text-align: center; color: var(--text-3);">
-                            <div style="font-size: 14px; font-weight: 500; margin-bottom: 8px;">No live games</div>
-                            <div>Click "Scan Once" to search for live games</div>
-                            <div style="font-size: 12px; margin-top: 8px;">Requires ODDS_API_KEY in credentials.py</div>
-                        </td></tr>
-                    </tbody>
-                </table>
-            </div>
-
-            <!-- Arbitrage Opportunities -->
-            <div class="section-title">Arbitrage Opportunities <span class="badge" id="opps-badge">0</span></div>
-            <div class="table-container" id="sports-opps-container">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Game</th>
-                            <th>Market Type</th>
-                            <th class="text-right">Kalshi Price</th>
-                            <th class="text-right">Fair Value</th>
-                            <th class="text-right">Edge</th>
-                            <th class="text-right">Rec. Size</th>
+                            <th>Price Range</th>
+                            <th class="text-right">Market (YES)</th>
+                            <th class="text-right">Model (YES)</th>
+                            <th class="text-right">Best Trade</th>
                             <th class="text-right">Action</th>
                         </tr>
                     </thead>
-                    <tbody id="sports-opps-table">
-                        <tr><td colspan="7" class="text-muted" style="text-align:center; padding: 24px;">No opportunities found</td></tr>
-                    </tbody>
-                </table>
-            </div>
-
-            <!-- Recent Bets -->
-            <div class="section-title">Recent Bets <span class="badge" id="bets-badge">0</span></div>
-            <div class="table-container" id="sports-bets-container">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Time</th>
-                            <th>Game</th>
-                            <th>Side</th>
-                            <th class="text-right">Price</th>
-                            <th class="text-right">Size</th>
-                            <th class="text-right">Edge</th>
-                            <th>Status</th>
-                        </tr>
-                    </thead>
-                    <tbody id="sports-bets-table">
-                        <tr><td colspan="7" class="text-muted" style="text-align:center; padding: 24px;">No bets placed</td></tr>
+                    <tbody id="wti-table">
+                        <tr><td colspan="5" class="loading"><div class="spinner"></div> Loading...</td></tr>
                     </tbody>
                 </table>
             </div>
         </section>
+
+        <!-- Bitcoin Section -->
+        <section class="section" id="section-bitcoin">
+            <div class="futures-badge">
+                <span style="color: var(--text-3)">Bitcoin:</span>
+                <span class="price" id="bitcoin-price">-</span>
+                <span class="change" id="bitcoin-change">-</span>
+            </div>
+            <div class="table-container">
+                <table>
+                    <thead><tr><th>Price Range</th><th class="text-right">Market (YES)</th><th class="text-right">Model (YES)</th><th class="text-right">Best Trade</th><th class="text-right">Action</th></tr></thead>
+                    <tbody id="bitcoin-table"><tr><td colspan="5" class="loading"><div class="spinner"></div> Loading...</td></tr></tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- Ethereum Section -->
+        <section class="section" id="section-ethereum">
+            <div class="futures-badge">
+                <span style="color: var(--text-3)">Ethereum:</span>
+                <span class="price" id="ethereum-price">-</span>
+                <span class="change" id="ethereum-change">-</span>
+            </div>
+            <div class="table-container">
+                <table>
+                    <thead><tr><th>Price Range</th><th class="text-right">Market (YES)</th><th class="text-right">Model (YES)</th><th class="text-right">Best Trade</th><th class="text-right">Action</th></tr></thead>
+                    <tbody id="ethereum-table"><tr><td colspan="5" class="loading"><div class="spinner"></div> Loading...</td></tr></tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- Solana Section -->
+        <section class="section" id="section-solana">
+            <div class="futures-badge">
+                <span style="color: var(--text-3)">Solana:</span>
+                <span class="price" id="solana-price">-</span>
+                <span class="change" id="solana-change">-</span>
+            </div>
+            <div class="table-container">
+                <table>
+                    <thead><tr><th>Price Range</th><th class="text-right">Market (YES)</th><th class="text-right">Model (YES)</th><th class="text-right">Best Trade</th><th class="text-right">Action</th></tr></thead>
+                    <tbody id="solana-table"><tr><td colspan="5" class="loading"><div class="spinner"></div> Loading...</td></tr></tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- Dogecoin Section -->
+        <section class="section" id="section-dogecoin">
+            <div class="futures-badge">
+                <span style="color: var(--text-3)">Dogecoin:</span>
+                <span class="price" id="dogecoin-price">-</span>
+                <span class="change" id="dogecoin-change">-</span>
+            </div>
+            <div class="table-container">
+                <table>
+                    <thead><tr><th>Price Range</th><th class="text-right">Market (YES)</th><th class="text-right">Model (YES)</th><th class="text-right">Best Trade</th><th class="text-right">Action</th></tr></thead>
+                    <tbody id="dogecoin-table"><tr><td colspan="5" class="loading"><div class="spinner"></div> Loading...</td></tr></tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- XRP Section -->
+        <section class="section" id="section-xrp">
+            <div class="futures-badge">
+                <span style="color: var(--text-3)">XRP:</span>
+                <span class="price" id="xrp-price">-</span>
+                <span class="change" id="xrp-change">-</span>
+            </div>
+            <div class="table-container">
+                <table>
+                    <thead><tr><th>Price Range</th><th class="text-right">Market (YES)</th><th class="text-right">Model (YES)</th><th class="text-right">Best Trade</th><th class="text-right">Action</th></tr></thead>
+                    <tbody id="xrp-table"><tr><td colspan="5" class="loading"><div class="spinner"></div> Loading...</td></tr></tbody>
+                </table>
+            </div>
+        </section>
+
     </div>
 
     <script>
@@ -3702,8 +3665,6 @@ DASHBOARD_HTML = '''
                     financial_min_edge: parseFloat(document.getElementById('cfg-fin-min-edge').value) / 100,
                     financial_position_size: parseInt(document.getElementById('cfg-fin-position-size').value),
                     max_total_orders: parseInt(document.getElementById('cfg-max-orders').value),
-                    sports_min_edge: parseFloat(document.getElementById('cfg-sports-min-edge').value) / 100,
-                    sports_position_size: parseInt(document.getElementById('cfg-sports-bet-size').value),
                 };
                 const resp = await fetch('/api/trading-config', {
                     method: 'POST',
@@ -3731,8 +3692,6 @@ DASHBOARD_HTML = '''
                 document.getElementById('cfg-fin-min-edge').value = (data.financial_min_edge * 100).toFixed(1);
                 document.getElementById('cfg-fin-position-size').value = data.financial_position_size;
                 document.getElementById('cfg-max-orders').value = data.max_total_orders || 20;
-                document.getElementById('cfg-sports-min-edge').value = (data.sports_min_edge * 100).toFixed(1);
-                document.getElementById('cfg-sports-bet-size').value = data.sports_position_size;
             } catch (err) {}
         }
 
@@ -3934,6 +3893,38 @@ DASHBOARD_HTML = '''
                 }
                 renderMarkets(data.eurusd?.markets, 'eurusd-table', data.eurusd?.quote?.price);
 
+                // Render WTI Crude Oil
+                if (data.wti?.quote?.price) {
+                    const priceEl = document.getElementById('wti-price');
+                    priceEl.textContent = '$' + data.wti.quote.price.toFixed(2);
+                    const change = data.wti.quote.change || 0;
+                    const changeEl = document.getElementById('wti-change');
+                    changeEl.textContent = (change >= 0 ? '+' : '') + change.toFixed(2);
+                    changeEl.className = 'change ' + (change >= 0 ? 'text-green' : 'text-red');
+                }
+                renderMarkets(data.wti?.markets, 'wti-table', data.wti?.quote?.price);
+
+                // Render Crypto coins
+                const cryptoCoins = [
+                    {key: 'bitcoin', decimals: 2},
+                    {key: 'ethereum', decimals: 2},
+                    {key: 'solana', decimals: 2},
+                    {key: 'dogecoin', decimals: 4},
+                    {key: 'xrp', decimals: 4},
+                ];
+                for (const coin of cryptoCoins) {
+                    const d = data[coin.key];
+                    if (d?.quote?.price) {
+                        const priceEl = document.getElementById(coin.key + '-price');
+                        priceEl.textContent = '$' + d.quote.price.toLocaleString('en-US', {minimumFractionDigits: coin.decimals, maximumFractionDigits: coin.decimals});
+                        const change = d.quote.change || 0;
+                        const changeEl = document.getElementById(coin.key + '-change');
+                        changeEl.textContent = (change >= 0 ? '+' : '') + change.toFixed(coin.decimals);
+                        changeEl.className = 'change ' + (change >= 0 ? 'text-green' : 'text-red');
+                    }
+                    renderMarkets(d?.markets, coin.key + '-table', d?.quote?.price);
+                }
+
             } catch (err) {
                 console.error('Failed to load data:', err);
             }
@@ -3944,7 +3935,6 @@ DASHBOARD_HTML = '''
         loadTradingPlan();
         loadAutoTraderStatus();
         loadConfig();
-        loadSportsStatus();
         setInterval(loadData, 1000);  // Market data every 1 second
         setInterval(loadTradingPlan, 5000);  // Trading plan every 5 seconds
         setInterval(loadAutoTraderStatus, 2000);  // Auto-trader status every 2 seconds
@@ -3965,319 +3955,6 @@ DASHBOARD_HTML = '''
         }
         setInterval(updateFreshness, 500);
 
-        // ================== SPORTS ARBITRAGE ==================
-
-        let sportsData = {
-            running: false,
-            configured: false,
-            configLoaded: false,
-            dry_run: true,
-            games: [],
-            opportunities: [],
-            bets: []
-        };
-
-        // Load sports status
-        async function loadSportsStatus() {
-            try {
-                const resp = await fetch('/api/sports/status');
-                const data = await resp.json();
-
-                if (data.error) {
-                    sportsData.configured = false;
-                    document.getElementById('sports-status-text').textContent = 'Not Configured';
-                    document.getElementById('sports-status-light').classList.remove('running');
-                    const roText = document.getElementById('sports-status-text-ro');
-                    if (roText) roText.textContent = 'Not Configured';
-                    const roLight = document.getElementById('sports-status-light-ro');
-                    if (roLight) roLight.classList.remove('running');
-                    return;
-                }
-
-                sportsData.configured = true;
-                sportsData.running = data.running;
-                sportsData.dry_run = data.dry_run ?? true;
-
-                const statusLight = document.getElementById('sports-status-light');
-                const statusText = document.getElementById('sports-status-text');
-                const modeBadge = document.getElementById('sports-mode-badge');
-                const dryToggle = document.getElementById('sports-dry-toggle');
-
-                if (data.running) {
-                    statusLight.classList.add('running');
-                    statusText.textContent = 'Scanning...';
-                } else {
-                    statusLight.classList.remove('running');
-                    statusText.textContent = 'Stopped';
-                }
-
-                // Dry run badge
-                if (sportsData.dry_run) {
-                    modeBadge.textContent = 'DRY RUN';
-                    modeBadge.style.background = 'var(--orange)';
-                    modeBadge.style.color = 'var(--bg-0)';
-                    dryToggle.textContent = 'DRY RUN';
-                    dryToggle.style.background = 'var(--orange)';
-                    dryToggle.style.color = 'var(--bg-0)';
-                } else {
-                    modeBadge.textContent = 'LIVE';
-                    modeBadge.style.background = 'var(--green)';
-                    modeBadge.style.color = 'var(--bg-0)';
-                    dryToggle.textContent = 'LIVE';
-                    dryToggle.style.background = 'var(--green)';
-                    dryToggle.style.color = 'var(--bg-0)';
-                }
-
-                // Stats - align with get_status() response
-                document.getElementById('sports-game-count').textContent = data.live_games || 0;
-                document.getElementById('sports-opp-count').textContent = data.opportunities || 0;
-                document.getElementById('sports-bet-count').textContent = data.bets_placed || 0;
-                document.getElementById('sports-exposure').textContent = '$' + fmt(data.total_exposure || 0);
-                document.getElementById('sports-pnl').textContent = '$0';  // TODO: track P&L
-
-                // Store data for rendering
-                sportsData.games = data.games || [];
-                sportsData.opportunities = data.top_opportunities || [];
-                sportsData.bets = data.recent_bets || [];
-
-                // Update badges
-                document.getElementById('games-badge').textContent = sportsData.games.length;
-                document.getElementById('opps-badge').textContent = sportsData.opportunities.length;
-                document.getElementById('bets-badge').textContent = sportsData.bets.length;
-
-                // Render tables
-                renderSportsGames(sportsData.games);
-                renderSportsOpportunities(sportsData.opportunities);
-                renderSportsBets(sportsData.bets);
-
-                // Update read-only elements on Sports tab
-                const roLight = document.getElementById('sports-status-light-ro');
-                const roText = document.getElementById('sports-status-text-ro');
-                const roBadge = document.getElementById('sports-mode-badge-ro');
-                if (roLight && roText) {
-                    if (data.running) {
-                        roLight.classList.add('running');
-                        roText.textContent = 'Scanning...';
-                    } else {
-                        roLight.classList.remove('running');
-                        roText.textContent = 'Stopped';
-                    }
-                }
-                if (roBadge) {
-                    if (sportsData.dry_run) {
-                        roBadge.textContent = 'DRY RUN';
-                        roBadge.style.background = 'var(--orange)';
-                        roBadge.style.color = 'var(--bg-0)';
-                    } else {
-                        roBadge.textContent = 'LIVE';
-                        roBadge.style.background = 'var(--green)';
-                        roBadge.style.color = 'var(--bg-0)';
-                    }
-                }
-                const roGames = document.getElementById('sports-game-count-ro');
-                const roOpps = document.getElementById('sports-opp-count-ro');
-                const roBets = document.getElementById('sports-bet-count-ro');
-                if (roGames) roGames.textContent = data.live_games || 0;
-                if (roOpps) roOpps.textContent = data.opportunities || 0;
-                if (roBets) roBets.textContent = data.bets_placed || 0;
-
-                // Sports config is now part of unified trading config (loaded separately)
-
-            } catch (err) {
-                console.error('Failed to load sports status:', err);
-            }
-        }
-
-        // Render live games table
-        function renderSportsGames(games) {
-            const tbody = document.getElementById('sports-games-table');
-
-            if (!games || games.length === 0) {
-                tbody.innerHTML = `
-                    <tr><td colspan="5" class="empty" style="padding: 40px; text-align: center; color: var(--text-3);">
-                        <div style="font-size: 14px; font-weight: 500; margin-bottom: 8px;">No live games found</div>
-                    </td></tr>
-                `;
-                return;
-            }
-
-            tbody.innerHTML = games.map(g => {
-                // Format best edge for display
-                const hasEdge = g.best_edge != null;
-                const edgeStr = hasEdge ? '+' + g.best_edge.toFixed(1) + '%' : '-';
-                const edgeColor = hasEdge && g.best_edge > 0 ? 'var(--green)' : '';
-
-                return `
-                    <tr>
-                        <td>${esc(formatSportName(g.sport))}</td>
-                        <td>
-                            <div style="font-weight: 500;">${esc(g.display_name || 'Unknown Game')}</div>
-                            <div style="font-size: 11px; color: var(--text-3);">${esc(g.event_ticker || '')}</div>
-                        </td>
-                        <td>
-                            <span style="color: ${g.is_live ? 'var(--green)' : 'var(--text-3)'}">
-                                ${g.is_live ? 'LIVE' : 'Scheduled'}
-                            </span>
-                            ${g.matched ? '<span style="color: var(--blue); margin-left: 8px; font-size: 11px;" title="Matched to sportsbook odds">MATCHED</span>' : ''}
-                        </td>
-                        <td>${g.markets_count || 0} markets</td>
-                        <td class="text-right" style="${edgeColor ? 'color: ' + edgeColor + '; font-weight: 600;' : ''}">${edgeStr}</td>
-                    </tr>
-                `;
-            }).join('');
-        }
-
-        // Format sport name for display
-        function formatSportName(sport) {
-            if (!sport) return 'Unknown';
-            const names = {
-                'basketball_nba': 'NBA',
-                'americanfootball_nfl': 'NFL',
-                'icehockey_nhl': 'NHL',
-                'baseball_mlb': 'MLB',
-                'soccer_usa_mls': 'MLS',
-                'mma_ufc': 'UFC'
-            };
-            return names[sport.toLowerCase()] || sport.replace(/_/g, ' ');
-        }
-
-        // Render opportunities table
-        function renderSportsOpportunities(opps) {
-            const tbody = document.getElementById('sports-opps-table');
-
-            if (!opps || opps.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" class="text-muted" style="text-align:center; padding: 24px;">No opportunities found</td></tr>';
-                return;
-            }
-
-            tbody.innerHTML = opps.map(o => {
-                const edgePct = o.edge_pct || 0;
-                const edgeClass = edgePct >= 5 ? 'positive' : '';
-                const staleClass = o.is_stale ? 'text-muted' : '';
-
-                return `
-                    <tr class="${staleClass}">
-                        <td>
-                            <div style="font-weight: 500;">${esc(o.title || o.ticker)}</div>
-                            <div style="font-size: 11px; color: var(--text-3);">${esc(o.best_book || '')}</div>
-                        </td>
-                        <td>${esc(o.side || 'Unknown')}</td>
-                        <td class="text-right mono">${pct(o.kalshi_price)}</td>
-                        <td class="text-right mono">${pct(o.fair_value)}</td>
-                        <td class="text-right"><span class="edge ${edgeClass}">+${edgePct.toFixed(1)}%</span></td>
-                        <td class="text-right">10</td>
-                        <td class="text-right">
-                            <button class="place-btn" onclick="placeSportsBet('${o.ticker}', '${o.side}', ${o.kalshi_price}, 10)">
-                                ${o.side} @ ${Math.round((o.kalshi_price || 0) * 100)}c
-                            </button>
-                        </td>
-                    </tr>
-                `;
-            }).join('');
-        }
-
-        // Render recent bets table
-        function renderSportsBets(bets) {
-            const tbody = document.getElementById('sports-bets-table');
-
-            if (!bets || bets.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="7" class="text-muted" style="text-align:center; padding: 24px;">No bets placed</td></tr>';
-                return;
-            }
-
-            tbody.innerHTML = bets.slice(0, 20).map(b => {
-                const timeStr = b.placed_at ? new Date(b.placed_at).toLocaleTimeString() : '-';
-                const statusClass = b.status === 'filled' ? 'text-green' : (b.status === 'pending' ? 'text-blue' : 'text-muted');
-
-                return `
-                    <tr>
-                        <td class="mono" style="font-size: 12px;">${esc(timeStr)}</td>
-                        <td>${esc(b.ticker || '-')}</td>
-                        <td><span class="position-side ${b.side?.toLowerCase()}">${esc(b.side || '-')}</span></td>
-                        <td class="text-right mono">${b.price ? Math.round(b.price * 100) + 'c' : '-'}</td>
-                        <td class="text-right">${b.size || 0}</td>
-                        <td class="text-right">${b.edge_pct ? '+' + b.edge_pct.toFixed(1) + '%' : '-'}</td>
-                        <td class="${statusClass}">${b.status || 'unknown'}</td>
-                    </tr>
-                `;
-            }).join('');
-        }
-
-        // Toggle dry run mode
-        async function toggleSportsDryRun() {
-            const newValue = !sportsData.dry_run;
-
-            if (!newValue && !confirm('Switch to LIVE mode? Real money will be at risk.')) {
-                return;
-            }
-
-            try {
-                const resp = await fetch('/api/sports/config', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({dry_run: newValue})
-                });
-                const data = await resp.json();
-                if (data.error) {
-                    alert('Error: ' + data.error);
-                } else {
-                    sportsData.dry_run = newValue;
-                    loadSportsStatus();
-                }
-            } catch (err) {
-                alert('Failed to toggle: ' + err);
-            }
-        }
-
-        // Sports config is now part of the unified Trading Config panel.
-        // The /api/sports/config endpoint remains for programmatic access.
-
-        // Place a sports bet
-        async function placeSportsBet(ticker, side, price, size) {
-            if (sportsData.dry_run) {
-                alert('Cannot place bets in DRY RUN mode. Switch to LIVE mode first.');
-                return;
-            }
-
-            if (!confirm(`Place ${side} order for ${size} contracts at ${Math.round(price * 100)}c?`)) {
-                return;
-            }
-
-            try {
-                const resp = await fetch('/api/place-order', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ticker, side, price: Math.round(price * 100), size})
-                });
-                const data = await resp.json();
-                if (data.error) {
-                    alert('Error: ' + data.error);
-                } else {
-                    alert('Order placed!');
-                    loadSportsStatus();
-                }
-            } catch (err) {
-                alert('Failed to place bet: ' + err);
-            }
-        }
-
-        // Load sports data on section switch (Trading Plan or Sports tab)
-        document.querySelectorAll('.tab').forEach(tab => {
-            tab.addEventListener('click', () => {
-                if (tab.dataset.tab === 'sports' || tab.dataset.tab === 'trading') {
-                    loadSportsStatus();
-                }
-            });
-        });
-
-        // Periodic refresh when Trading Plan or Sports tab is active (every 5 seconds)
-        setInterval(() => {
-            const tradingActive = document.getElementById('section-trading')?.classList.contains('active');
-            const sportsActive = document.getElementById('section-sports')?.classList.contains('active');
-            if (tradingActive || sportsActive) {
-                loadSportsStatus();
-            }
-        }, 5000);
     </script>
 </body>
 </html>

@@ -92,7 +92,8 @@ class TraderConfig:
     # MARKET MAKING MODE (for wide-spread markets)
     market_making_enabled: bool = True   # Enable market making on wide spreads
     market_making_min_spread: int = 10   # Min spread (ask-bid) to trigger market making (lowered to include range markets)
-    market_making_edge_buffer: float = 0.40  # Place bid at 40% discount from FV for significant edge
+    market_making_edge_buffer: float = 0.12  # Place bid at 12% discount from FV (tighter than retail)
+    market_making_edge_cents: int = 6       # Absolute cap: max 6c discount from FV
     market_making_max_fv: float = 0.92   # Allow market making up to 92% FV (on that side)
     market_making_min_fv: float = 0.08   # Allow market making down to 8% FV (below this, trade the other side)
 
@@ -104,7 +105,7 @@ class TraderConfig:
     sanity_check_prices: bool = True     # Validate fair values before trading
 
     # ORDER MANAGEMENT
-    max_order_age_seconds: int = 300     # Cancel orders older than 5 minutes
+    max_order_age_seconds: int = 180     # Cancel orders older than 3 minutes (stay fresher than retail stale orders)
 
     # DATA QUALITY
     data_delay_buffer: float = 0.005     # Extra 0.5% edge for data delay
@@ -128,6 +129,17 @@ class TraderConfig:
     # FAIR VALUE VALIDATION
     fv_deviation_warn_threshold: float = 0.20   # Warn if FV deviates >20% from market mid
     fv_deviation_reject_threshold: float = 0.40 # Reject if FV deviates >40% from market mid
+
+    # NEAR-EXPIRY TRADING
+    near_expiry_min_minutes: int = 3     # Allow trading up to 3 min before expiry (down from 5)
+
+    # VIX-BASED ORDER SCALING
+    vix_scale_orders: bool = True        # Scale max orders with VIX
+    vix_high_threshold: float = 25.0     # VIX > 25 → 1.5x orders
+    vix_extreme_threshold: float = 35.0  # VIX > 35 → 2.0x orders
+
+    # EVENT TRADING
+    trade_through_events: bool = True    # Continue trading during FOMC/CPI (vol boost handles risk)
 
     # DRY RUN MODE
     dry_run: bool = False                # If True, log orders but don't execute
@@ -171,6 +183,7 @@ class AutoTrader:
             self.config.max_daily_loss_pct = risk_config.max_daily_loss_pct
         self.active_orders: dict[str, ActiveOrder] = {}  # order_id -> ActiveOrder
         self.market_orders: dict[str, str] = {}  # ticker -> order_id (1 per market)
+        self.market_making_orders: dict[str, dict[str, str]] = {}  # ticker -> {"yes": order_id, "no": order_id}
         self.running = False
         self._lock = threading.Lock()
 
@@ -203,6 +216,12 @@ class AutoTrader:
         self._fill_timestamps: deque[float] = deque(maxlen=50)       # Entry fills only
         self._exit_fill_timestamps: deque[float] = deque(maxlen=50)  # Exit fills (informational)
         self._fill_pause_until: Optional[float] = None
+
+        # VIX price for dynamic order scaling (set by app.py from futures data)
+        self._vix_price: Optional[float] = None
+
+        # Balance cache per trading loop iteration (avoids multiple API calls per loop)
+        self._loop_balance: Optional[float] = None
 
         # Diagnostic logging timer
         self._last_diag_log: datetime = datetime.min.replace(tzinfo=timezone.utc)
@@ -338,12 +357,19 @@ class AutoTrader:
             )
 
     def get_total_exposure(self) -> float:
-        """Calculate total $ exposure across all positions"""
+        """Calculate total $ exposure across all positions (mark-to-market)"""
         total = 0
         with self._lock:
             for pos in self.positions.values():
-                # Exposure = quantity * avg_price (in dollars)
-                total += pos.quantity * pos.avg_price
+                # Use current market prices (MTM) instead of cost basis
+                market = self._markets_cache.get(pos.ticker)
+                if market and pos.side == "yes":
+                    mtm_price = (market.yes_bid or 0) / 100
+                elif market and pos.side == "no":
+                    mtm_price = (100 - (market.yes_ask or 100)) / 100 if market.yes_ask else pos.avg_price
+                else:
+                    mtm_price = pos.avg_price
+                total += pos.quantity * mtm_price
         return total
 
     # ========== SAFETY CHECKS ==========
@@ -371,14 +397,18 @@ class AutoTrader:
         Staleness/failure halts are handled by check_safety() to avoid
         re-entrant _halt calls and multiple cancel_all_orders bursts.
         """
-        balance = self.client.get_balance()
-        if balance is None:
-            self._consecutive_balance_failures += 1
-            balance = self._last_known_balance or 0
+        # Use cached balance from trading_loop if available (avoids double API call / double failure counting)
+        if self._loop_balance is not None:
+            balance = self._loop_balance
         else:
-            self._consecutive_balance_failures = 0
-            self._last_known_balance = balance
-            self._last_balance_time = datetime.now(timezone.utc)
+            balance = self.client.get_balance()
+            if balance is None:
+                self._consecutive_balance_failures += 1
+                balance = self._last_known_balance or 0
+            else:
+                self._consecutive_balance_failures = 0
+                self._last_known_balance = balance
+                self._last_balance_time = datetime.now(timezone.utc)
 
         # Add mark-to-market value of all positions using current prices
         position_value = 0
@@ -574,11 +604,14 @@ class AutoTrader:
 
         # Also reset daily tracking so we don't immediately halt again
         self._starting_balance = self.get_portfolio_value()
+        self._peak_equity = self._starting_balance  # Reset peak so drawdown starts fresh
+        self._save_daily_state()
 
         print(f"\n[{timestamp}] HALT STATE RESET")
         print(f"    Previous halt reason: {prev_reason}")
         print(f"    Previous starting equity: ${old_starting:.2f}" if old_starting else "    Previous: None")
         print(f"    New starting equity: ${self._starting_balance:.2f}")
+        print(f"    Peak equity reset to: ${self._peak_equity:.2f}")
         print(f"    Current balance: ${self.client.get_balance() or 0:.2f}")
         print(f"    Current equity: ${self.get_portfolio_value():.2f}")
         print(f"    Error history cleared")
@@ -913,7 +946,7 @@ class AutoTrader:
         )
 
         if side == "yes":
-            fair_cents = int(fair_yes * 100)
+            fair_cents = round(fair_yes * 100)
             current_bid = yes_bid
             current_ask = yes_ask
 
@@ -926,11 +959,10 @@ class AutoTrader:
                 # NOTE: No max FV check - high FV is GOOD for market making
                 # The edge requirement (5-10%) already protects us from overpaying
 
-                # Calculate market making bid: we want significant edge
-                # First compute edge target (discount from fair value)
-                edge_target = min(
-                    int(fair_cents * (1 - self.config.market_making_edge_buffer)),  # % discount from FV
-                    fair_cents - 5,  # At least 5c below FV
+                # Calculate market making bid: cap discount at absolute cents OR % buffer
+                edge_target = max(
+                    fair_cents - self.config.market_making_edge_cents,  # Caps discount at 6c
+                    int(fair_cents * (1 - self.config.market_making_edge_buffer)),  # 12% floor
                 )
                 # Then ensure we at least beat the existing bid for queue priority
                 mm_bid = max(
@@ -950,10 +982,10 @@ class AutoTrader:
                 fill_prob = self.tracker.predict_fill_probability(market, mm_bid, "yes")
                 fill_prob = max(0.03, min(fill_prob, 0.15))  # Expect 3-15% fills on market making
 
-                # For market making, require less edge on tighter spreads (they fill more often)
+                # For market making, tiered edge thresholds based on spread width
                 # Include transaction costs in the threshold
                 txn_cost = self.config.entry_fee_pct + self.config.exit_cost_pct
-                min_mm_edge = (0.05 if spread < 30 else 0.10) + txn_cost
+                min_mm_edge = (0.03 if spread < 20 else 0.05 if spread < 30 else 0.08) + txn_cost
                 if edge >= min_mm_edge:
                     return (mm_bid, edge, fill_prob)
                 return None
@@ -1008,7 +1040,7 @@ class AutoTrader:
             return (optimal_bid, edge, fill_prob)
 
         else:  # NO side
-            fair_cents = int(fair_no * 100)
+            fair_cents = round(fair_no * 100)
             # CRITICAL FIX: Derive NO prices from YES prices
             # NO bid = 100 - YES ask (buying YES at ask = selling NO at bid)
             # NO ask = 100 - YES bid (selling YES at bid = buying NO at ask)
@@ -1024,11 +1056,10 @@ class AutoTrader:
                 # NOTE: No max FV check for NO side - high FV is GOOD for market making
                 # The edge requirement (5-10%) already protects us from overpaying
 
-                # Calculate market making bid for NO side
-                # First compute edge target (discount from fair value)
-                edge_target = min(
-                    int(fair_cents * (1 - self.config.market_making_edge_buffer)),  # % discount from FV
-                    fair_cents - 5,  # At least 5c below FV
+                # Calculate market making bid for NO side: cap discount at absolute cents OR % buffer
+                edge_target = max(
+                    fair_cents - self.config.market_making_edge_cents,  # Caps discount at 6c
+                    int(fair_cents * (1 - self.config.market_making_edge_buffer)),  # 12% floor
                 )
                 # Then ensure we at least beat the existing bid for queue priority
                 mm_bid = max(
@@ -1047,10 +1078,10 @@ class AutoTrader:
                 fill_prob = self.tracker.predict_fill_probability(market, mm_bid, "no")
                 fill_prob = max(0.03, min(fill_prob, 0.15))  # Expect 3-15% fills
 
-                # For market making, require less edge on tighter spreads (they fill more often)
+                # For market making, tiered edge thresholds based on spread width
                 # Include transaction costs in the threshold
                 txn_cost = self.config.entry_fee_pct + self.config.exit_cost_pct
-                min_mm_edge = (0.05 if spread < 30 else 0.10) + txn_cost
+                min_mm_edge = (0.03 if spread < 20 else 0.05 if spread < 30 else 0.08) + txn_cost
                 if edge >= min_mm_edge:
                     return (mm_bid, edge, fill_prob)
                 return None
@@ -1134,6 +1165,61 @@ class AutoTrader:
 
         return None
 
+    def get_mm_opportunities(self, market: Market) -> list[tuple[str, int, float, float]]:
+        """
+        Get market-making opportunities for BOTH sides of a wide-spread market.
+        Returns list of (side, price, edge, fill_prob) — up to 2 entries (YES and NO).
+        Only returns sides that don't already have an MM order.
+        """
+        if market.fair_value is None:
+            return []
+        if market.fair_value_time:
+            fv_age = (datetime.now(timezone.utc) - market.fair_value_time).total_seconds()
+            if fv_age > 15:
+                return []
+
+        yes_bid = market.yes_bid or 0
+        yes_ask = market.yes_ask or 100
+        spread = yes_ask - yes_bid
+        if spread < self.config.market_making_min_spread:
+            return []
+
+        results = []
+        existing_mm = self.market_making_orders.get(market.ticker, {})
+
+        for side in ("yes", "no"):
+            if side in existing_mm:
+                continue  # Already have MM order on this side
+            result = self.calculate_optimal_price(market, side)
+            if result:
+                results.append((side, result[0], result[1], result[2]))
+
+        return results
+
+    def place_mm_order(self, market: Market, side: str, price: int) -> Optional[str]:
+        """Place a market-making order and track it separately from directional orders."""
+        order_id = self.place_order(market, side, price)
+        if order_id:
+            with self._lock:
+                if market.ticker not in self.market_making_orders:
+                    self.market_making_orders[market.ticker] = {}
+                self.market_making_orders[market.ticker][side] = order_id
+                # Remove from market_orders so it doesn't block directional orders
+                if market.ticker in self.market_orders and self.market_orders[market.ticker] == order_id:
+                    del self.market_orders[market.ticker]
+        return order_id
+
+    def cancel_mm_order(self, order_id: str, ticker: str, side: str, reason: str = "") -> bool:
+        """Cancel an MM order and clean up tracking."""
+        success = self.cancel_order(order_id, reason)
+        if success:
+            with self._lock:
+                if ticker in self.market_making_orders:
+                    self.market_making_orders[ticker].pop(side, None)
+                    if not self.market_making_orders[ticker]:
+                        del self.market_making_orders[ticker]
+        return success
+
     def should_cancel_order(self, order: ActiveOrder, market: Market) -> tuple[bool, str]:
         """
         Determine if an existing order should be cancelled.
@@ -1170,12 +1256,12 @@ class AutoTrader:
 
     def get_max_exposure(self) -> float:
         """Get maximum allowed exposure based on account balance"""
-        balance = self.client.get_balance() or self._last_known_balance or 0
+        balance = self._loop_balance or self._last_known_balance or 0
         return balance * self.config.max_capital_pct
 
     def get_max_position_value_per_market(self) -> float:
         """Get maximum allowed position value per single market"""
-        balance = self.client.get_balance() or self._last_known_balance or 0
+        balance = self._loop_balance or self._last_known_balance or 0
         return balance * self.config.max_position_pct_per_market
 
     def place_order(self, market: Market, side: str, price: int) -> Optional[str]:
@@ -1340,6 +1426,11 @@ class AutoTrader:
                         del self.active_orders[order_id]
                         if order.ticker in self.market_orders:
                             del self.market_orders[order.ticker]
+                        # Clean up MM tracking
+                        if order.ticker in self.market_making_orders:
+                            self.market_making_orders[order.ticker].pop(order.side, None)
+                            if not self.market_making_orders[order.ticker]:
+                                del self.market_making_orders[order.ticker]
                         print(f"[DRY RUN] Would cancel: {order.side.upper()} @ {order.price}c ({reason})")
                 return True
 
@@ -1355,6 +1446,11 @@ class AutoTrader:
                     del self.active_orders[order_id]
                     if order.ticker in self.market_orders:
                         del self.market_orders[order.ticker]
+                    # Clean up MM tracking
+                    if order.ticker in self.market_making_orders:
+                        self.market_making_orders[order.ticker].pop(order.side, None)
+                        if not self.market_making_orders[order.ticker]:
+                            del self.market_making_orders[order.ticker]
                     print(f"[TRADER] Cancelled: {order.side.upper()} @ {order.price}c ({reason})")
 
             # Record cancellation for fill probability tracking
@@ -1557,6 +1653,11 @@ class AutoTrader:
                         self._update_position_on_fill(ticker, side, new_fills, price)
                     if ticker in self.market_orders:
                         del self.market_orders[ticker]
+                    # Clean up MM tracking
+                    if ticker in self.market_making_orders:
+                        self.market_making_orders[ticker].pop(side, None)
+                        if not self.market_making_orders[ticker]:
+                            del self.market_making_orders[ticker]
                     if oid in self.active_orders:
                         del self.active_orders[oid]
 
@@ -1565,13 +1666,14 @@ class AutoTrader:
 
     def get_available_capital(self) -> float:
         """Get available capital for new orders"""
-        balance = self.client.get_balance() or self._last_known_balance or 0
+        balance = self._loop_balance or self._last_known_balance or 0
         max_capital = balance * self.config.max_capital_pct
 
-        # Subtract capital already committed
+        # Subtract capital already committed (exclude exit orders — they free capital, not consume it)
         committed = sum(
             o.price * o.size / 100
             for o in self.active_orders.values()
+            if not o.is_exit
         )
 
         return max(0, max_capital - committed)
@@ -1601,20 +1703,32 @@ class AutoTrader:
 
         self._last_exit_check = now
 
-        # Get real positions from Kalshi (source of truth)
-        raw_positions = self.client.get_positions()
-        if raw_positions is None or len(raw_positions) == 0:
-            return 0
-
-        # Build market lookup
+        # Build Position objects from local tracking (synced by sync_positions every 10s)
+        # Avoids a duplicate API call — self.positions is already up-to-date
         market_map = {m.ticker: m for m in markets}
-
-        # Attach fv_at_entry from our local tracking to the Position objects
+        raw_positions = []
         with self._lock:
-            for pos in raw_positions:
-                local_pos = self.positions.get(pos.ticker)
-                if local_pos and local_pos.fv_at_entry is not None:
-                    pos.fv_at_entry = local_pos.fv_at_entry
+            for pos in self.positions.values():
+                if pos.quantity <= 0:
+                    continue
+                market = self._markets_cache.get(pos.ticker)
+                p = Position(
+                    ticker=pos.ticker,
+                    market_title=market.title if market else pos.ticker,
+                    side=Side.YES if pos.side == "yes" else Side.NO,
+                    quantity=pos.quantity,
+                    avg_price=pos.avg_price,
+                    realized_pnl=pos.pnl,
+                    fv_at_entry=pos.fv_at_entry,
+                )
+                # Attach current market data for P&L calculation
+                if market:
+                    p.current_bid = (market.yes_bid or 0) / 100
+                    p.current_ask = (market.yes_ask or 100) / 100
+                    p.fair_value = market.fair_value
+                raw_positions.append(p)
+        if not raw_positions:
+            return 0
 
         # Analyze positions
         recommendations = self.position_manager.analyze_all_positions(raw_positions, market_map)
@@ -1776,10 +1890,21 @@ class AutoTrader:
             print(f"[SAFETY] Fill rate breaker: {len(self._fill_timestamps)} fills in 60s — pausing 120s")
             return
 
+        # Cache balance once per loop to avoid multiple API calls
+        self._loop_balance = self.client.get_balance()
+        if self._loop_balance is not None:
+            self._last_known_balance = self._loop_balance
+            self._last_balance_time = datetime.now(timezone.utc)
+            self._consecutive_balance_failures = 0
+        else:
+            self._consecutive_balance_failures += 1
+            self._loop_balance = self._last_known_balance
+
         # SAFETY CHECK FIRST
         is_safe, reason = self.check_safety()
         if not is_safe:
             print(f"[SAFETY] Trading halted: {reason}")
+            self._loop_balance = None
             return  # Don't trade if safety check fails
 
         try:
@@ -1795,12 +1920,20 @@ class AutoTrader:
             if self.config.sanity_check_prices:
                 markets = [m for m in markets if self.validate_fair_value(m)]
 
-            # Filter out markets that are too close to expiry (< 5 minutes)
-            markets = [m for m in markets if not self.is_near_expiry(m, min_minutes=5)]
+            # Filter out markets that are too close to expiry
+            markets = [m for m in markets if not self.is_near_expiry(m, min_minutes=self.config.near_expiry_min_minutes)]
 
             # Track order operations this loop (rate limiting)
             ops_this_loop = 0
             max_ops_per_loop = 8  # Stay under Kalshi's 10 writes/sec
+
+            # VIX-based dynamic order scaling
+            effective_max_orders = self.config.max_total_orders
+            if self.config.vix_scale_orders and self._vix_price:
+                if self._vix_price > self.config.vix_extreme_threshold:
+                    effective_max_orders = int(self.config.max_total_orders * 2.0)
+                elif self._vix_price > self.config.vix_high_threshold:
+                    effective_max_orders = int(self.config.max_total_orders * 1.5)
 
             # Build market lookup for speed
             market_map = {m.ticker: m for m in markets}
@@ -1853,7 +1986,7 @@ class AutoTrader:
                     break
                 if available_capital < min_order_cost:
                     break
-                if len(self.active_orders) >= self.config.max_total_orders:
+                if len(self.active_orders) >= effective_max_orders:
                     break
                 if ticker in self.market_orders:  # Already have new order
                     continue
@@ -1871,7 +2004,7 @@ class AutoTrader:
             # PHASE 3: Place new orders on markets without orders
             if ops_this_loop >= max_ops_per_loop:
                 return
-            if len(self.active_orders) >= self.config.max_total_orders:
+            if len(self.active_orders) >= effective_max_orders:
                 return
             if available_capital < min_order_cost:
                 return
@@ -1909,7 +2042,7 @@ class AutoTrader:
                     asset_classes[ac] = asset_classes.get(ac, 0) + 1
                 print(f"[TRADER] Phase 3: {len(opportunities)} opps ({asset_classes}), "
                       f"skipped: {skipped_markets}, "
-                      f"orders: {len(self.active_orders)}/{self.config.max_total_orders}, "
+                      f"orders: {len(self.active_orders)}/{effective_max_orders}, "
                       f"capital: ${available_capital:.0f}")
                 # Log rejected markets that have significant displayed edge (helps debug)
                 for market in markets:
@@ -1932,7 +2065,7 @@ class AutoTrader:
             for market, side, price, edge, fill_prob, ev in opportunities:
                 if ops_this_loop >= max_ops_per_loop:
                     break
-                if len(self.active_orders) >= self.config.max_total_orders:
+                if len(self.active_orders) >= effective_max_orders:
                     break
                 actual_cost = self.config.position_size * price / 100
                 if available_capital < actual_cost:
@@ -1942,10 +2075,57 @@ class AutoTrader:
                 ops_this_loop += 1
                 available_capital -= actual_cost
 
+            # PHASE 4: Dual-sided market making on wide-spread markets
+            if self.config.market_making_enabled and ops_this_loop < max_ops_per_loop:
+                # Cancel stale MM orders first
+                for ticker, sides in list(self.market_making_orders.items()):
+                    for side, order_id in list(sides.items()):
+                        if ops_this_loop >= max_ops_per_loop:
+                            break
+                        order = self.active_orders.get(order_id)
+                        if not order:
+                            # Order already filled/cancelled, clean up tracking
+                            with self._lock:
+                                if ticker in self.market_making_orders:
+                                    self.market_making_orders[ticker].pop(side, None)
+                                    if not self.market_making_orders[ticker]:
+                                        del self.market_making_orders[ticker]
+                            continue
+                        market = market_map.get(ticker)
+                        if market:
+                            should_cancel, reason = self.should_cancel_order(order, market)
+                            if should_cancel:
+                                self.cancel_mm_order(order_id, ticker, side, f"MM: {reason}")
+                                ops_this_loop += 1
+
+                # Place new MM orders on both sides
+                for market in markets:
+                    if ops_this_loop >= max_ops_per_loop:
+                        break
+                    if len(self.active_orders) >= effective_max_orders:
+                        break
+                    if available_capital < min_order_cost:
+                        break
+
+                    mm_opps = self.get_mm_opportunities(market)
+                    for side, price, edge, fill_prob in mm_opps:
+                        if ops_this_loop >= max_ops_per_loop:
+                            break
+                        if len(self.active_orders) >= effective_max_orders:
+                            break
+                        actual_cost = self.config.position_size * price / 100
+                        if available_capital < actual_cost:
+                            continue
+                        self.place_mm_order(market, side, price)
+                        ops_this_loop += 1
+                        available_capital -= actual_cost
+
         except Exception as e:
             self.record_error(e, message="Trading loop")
             import traceback
             traceback.print_exc()
+        finally:
+            self._loop_balance = None  # Clear cached balance at end of loop
 
     def get_status(self) -> dict:
         """Get current trader status including positions"""

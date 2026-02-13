@@ -25,9 +25,3 @@ YOUR_PRIVATE_KEY_HERE
 # Free tier: 1k requests/month | Pro ($15/mo): 50k requests + WebSocket
 INSIGHTSENTRY_API_KEY = "your-rapidapi-key-here"
 
-# =============================================================================
-# THE ODDS API (for sports betting arbitrage)
-# =============================================================================
-# Get your API key at: https://the-odds-api.com/
-# Free tier: 500 requests/month
-ODDS_API_KEY = "your-odds-api-key-here"

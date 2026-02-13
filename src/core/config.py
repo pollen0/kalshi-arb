@@ -32,6 +32,25 @@ class SettlementConfig:
         "KXINXU": "^GSPC",
         # Treasury settles to actual yield
         "KXTNOTED": "^TNX",
+        # WTI Crude Oil
+        "KXWTI": "CL=F",
+        "KXWTIW": "CL=F",
+        # Crypto — settles to CF Benchmarks Real-Time Index
+        "KXBTC": "BTC-USD",
+        "KXBTC15M": "BTC-USD",
+        "KXBTCD": "BTC-USD",
+        "KXETH": "ETH-USD",
+        "KXETH15M": "ETH-USD",
+        "KXETHD": "ETH-USD",
+        "KXSOL": "SOL-USD",
+        "KXSOL15M": "SOL-USD",
+        "KXSOLD": "SOL-USD",
+        "KXDOGE": "DOGE-USD",
+        "KXDOGE15M": "DOGE-USD",
+        "KXDOGED": "DOGE-USD",
+        "KXXRP": "XRP-USD",
+        "KXXRP15M": "XRP-USD",
+        "KXXRPD": "XRP-USD",
     })
 
     # Futures symbols for real-time price tracking
@@ -76,6 +95,23 @@ class AssetClassConfig:
         "KXINX": "spx",
         "KXINXU": "spx",
         "KXTNOTED": "treasury",
+        "KXWTI": "wti",
+        "KXWTIW": "wti",
+        "KXBTC": "bitcoin",
+        "KXBTC15M": "bitcoin",
+        "KXBTCD": "bitcoin",
+        "KXETH": "ethereum",
+        "KXETH15M": "ethereum",
+        "KXETHD": "ethereum",
+        "KXSOL": "solana",
+        "KXSOL15M": "solana",
+        "KXSOLD": "solana",
+        "KXDOGE": "dogecoin",
+        "KXDOGE15M": "dogecoin",
+        "KXDOGED": "dogecoin",
+        "KXXRP": "xrp",
+        "KXXRP15M": "xrp",
+        "KXXRPD": "xrp",
     })
 
     # Trading hours per day by asset class (for time conversion)
@@ -84,6 +120,8 @@ class AssetClassConfig:
         "futures": 23.0,    # Nearly 24-hour trading
         "forex": 24.0,      # 24-hour market
         "treasury": 6.5,    # Similar to equity hours
+        "commodity": 23.0,  # Oil trades ~23h/day
+        "crypto": 24.0,     # 24/7 market
     })
 
     # Asset class types for volatility modeling
@@ -95,6 +133,12 @@ class AssetClassConfig:
         "treasury10y": "yield",
         "usdjpy": "forex",
         "eurusd": "forex",
+        "wti": "commodity",
+        "bitcoin": "crypto",
+        "ethereum": "crypto",
+        "solana": "crypto",
+        "dogecoin": "crypto",
+        "xrp": "crypto",
     })
 
     # Typical volatility ratios between related assets
@@ -106,9 +150,9 @@ class AssetClassConfig:
 
 @dataclass
 class RiskConfig:
-    """Risk management configuration — shared across financial and sports systems"""
+    """Risk management configuration"""
 
-    # === Shared risk (applies to both financial + sports) ===
+    # === Shared risk ===
     max_daily_loss_pct: float = 0.10            # Stop if down 10% (relaxed for small accounts)
     max_drawdown_pct: float = 0.15              # Max 15% drawdown from peak equity
     max_total_exposure: float = 0.80            # Max 80% total exposure
@@ -116,8 +160,6 @@ class RiskConfig:
     # === Strategy-specific defaults ===
     financial_min_edge: float = 0.02            # Financial: 2% min edge
     financial_position_size: int = 10           # Financial: 10 contracts
-    sports_min_edge: float = 0.05              # Sports: 5% min edge
-    sports_position_size: int = 20             # Sports: 20 contracts (max bet size)
 
     # === Non-UI settings (kept as hardcoded defaults) ===
     warning_daily_loss_pct: float = 0.03        # Warning at 3%
@@ -210,8 +252,6 @@ def save_config():
             "max_total_exposure": rc.max_total_exposure,
             "financial_min_edge": rc.financial_min_edge,
             "financial_position_size": rc.financial_position_size,
-            "sports_min_edge": rc.sports_min_edge,
-            "sports_position_size": rc.sports_position_size,
         }
     config_path = os.path.abspath(_CONFIG_FILE)
     os.makedirs(os.path.dirname(config_path), exist_ok=True)
@@ -250,7 +290,6 @@ def load_config():
         for key in (
             "max_daily_loss_pct", "max_drawdown_pct", "max_total_exposure",
             "financial_min_edge", "financial_position_size",
-            "sports_min_edge", "sports_position_size",
         ):
             if key in data:
                 setattr(new_config, key, type(getattr(new_config, key))(data[key]))

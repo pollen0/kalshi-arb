@@ -213,6 +213,16 @@ class KalshiClient:
             # Treasury: EOD only
             elif series_prefix in ["KXTNOTED"]:
                 time_patterns = [""]
+            # WTI Crude Oil: EOD only
+            elif series_prefix in ["KXWTI", "KXWTIW"]:
+                time_patterns = [""]
+            # Crypto: daily series have no suffix, hourly/15min use dynamic discovery
+            elif series_prefix in ["KXBTCD", "KXETHD", "KXSOLD", "KXDOGED", "KXXRPD"]:
+                time_patterns = [""]
+            elif series_prefix in ["KXBTC", "KXETH", "KXSOL", "KXDOGE", "KXXRP",
+                                   "KXBTC15M", "KXETH15M", "KXSOL15M", "KXDOGE15M", "KXXRP15M"]:
+                # Hourly/15-min crypto: many expirations per day, use bulk discovery
+                time_patterns = None  # Signal to skip pattern generation and rely on bulk query
             else:
                 # Default: try H1600 and empty
                 time_patterns = ["H1600", ""]
@@ -234,6 +244,10 @@ class KalshiClient:
 
         # If we didn't find any from the general query, try known patterns
         if not event_tickers:
+            if time_patterns is None:
+                # No known patterns (e.g., high-frequency crypto) — bulk query only
+                return all_markets
+
             # Generate event tickers for multiple days with all time patterns
             now = datetime.now(timezone.utc)
 
@@ -269,6 +283,8 @@ class KalshiClient:
             params.append(f"event_ticker={event_ticker}")
         if series_ticker:
             params.append(f"series_ticker={series_ticker}")
+        if status:
+            params.append(f"status={status}")
 
         result = self._request("GET", f"/markets?{'&'.join(params)}")
         if result.get("error"):
