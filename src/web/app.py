@@ -308,7 +308,7 @@ def create_app():
                 range_markets = []
                 try:
                     # Use get_markets_by_series_prefix which now checks all time patterns
-                    ndx_markets = state["client"].get_markets_by_series_prefix("KXNASDAQ100", status="active")
+                    ndx_markets = state["client"].get_markets_by_series_prefix("KXNASDAQ100", status="open")
                     for m in ndx_markets:
                         if m.lower_bound is not None and m.upper_bound is not None:
                             hours = hours_until(m.close_time)
@@ -332,7 +332,7 @@ def create_app():
                 # Get NASDAQ-100 above/below markets from all active slots
                 above_markets = []
                 try:
-                    ndx_above = state["client"].get_markets_by_series_prefix("KXNASDAQ100U", status="active")
+                    ndx_above = state["client"].get_markets_by_series_prefix("KXNASDAQ100U", status="open")
                     for m in ndx_above:
                         if m.lower_bound is not None:
                             hours = hours_until(m.close_time)
@@ -362,7 +362,7 @@ def create_app():
                 # Get S&P 500 range markets from all active slots
                 range_markets = []
                 try:
-                    spx_markets = state["client"].get_markets_by_series_prefix("KXINX", status="active")
+                    spx_markets = state["client"].get_markets_by_series_prefix("KXINX", status="open")
                     for m in spx_markets:
                         if m.lower_bound is not None and m.upper_bound is not None:
                             hours = hours_until(m.close_time)
@@ -386,7 +386,7 @@ def create_app():
                 # Get S&P 500 above/below markets from all active slots
                 above_markets = []
                 try:
-                    spx_above = state["client"].get_markets_by_series_prefix("KXINXU", status="active")
+                    spx_above = state["client"].get_markets_by_series_prefix("KXINXU", status="open")
                     for m in spx_above:
                         if m.lower_bound is not None:
                             hours = hours_until(m.close_time)
@@ -411,7 +411,7 @@ def create_app():
             # Update Treasury 10Y markets (KXTNOTED)
             try:
                 # Always fetch markets from Kalshi, regardless of quote availability
-                tnote_markets = state["client"].get_markets_by_series_prefix("KXTNOTED", status="active")
+                tnote_markets = state["client"].get_markets_by_series_prefix("KXTNOTED", status="open")
                 treasury_markets = []
 
                 # Try to get treasury quote (with Yahoo Finance fallback via get_quote)
@@ -491,7 +491,7 @@ def create_app():
                     usdjpy_price = usdjpy_quote.price
 
                     usdjpy_markets = []
-                    jpy_markets = state["client"].get_markets_by_series_prefix("KXUSDJPY", status="active")
+                    jpy_markets = state["client"].get_markets_by_series_prefix("KXUSDJPY", status="open")
                     for m in (jpy_markets or []):
                         hours = hours_until(m.close_time)
                         if hours and hours > 0:
@@ -523,7 +523,7 @@ def create_app():
                     eurusd_price = eurusd_quote.price
 
                     eurusd_markets = []
-                    eur_markets = state["client"].get_markets_by_series_prefix("KXEURUSD", status="active")
+                    eur_markets = state["client"].get_markets_by_series_prefix("KXEURUSD", status="open")
                     for m in (eur_markets or []):
                         hours = hours_until(m.close_time)
                         if hours and hours > 0:
@@ -561,7 +561,7 @@ def create_app():
                 wti_markets = []
                 # Fetch daily and weekly WTI markets
                 for series in ["KXWTI", "KXWTIW"]:
-                    raw = state["client"].get_markets_by_series_prefix(series, status="active")
+                    raw = state["client"].get_markets_by_series_prefix(series, status="open")
                     for m in (raw or []):
                         hours = hours_until(m.close_time)
                         if hours and hours > 0:
@@ -618,7 +618,7 @@ def create_app():
                     coin_markets = []
 
                     for series in coin_info["series"]:
-                        raw = state["client"].get_markets_by_series_prefix(series, status="active")
+                        raw = state["client"].get_markets_by_series_prefix(series, status="open")
                         for m in (raw or []):
                             hours = hours_until(m.close_time)
                             if hours and hours > 0:

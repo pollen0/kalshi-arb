@@ -179,7 +179,7 @@ class KalshiClient:
     def get_markets_by_series_prefix(
         self,
         series_prefix: str,
-        status: str = "active",
+        status: str = "open",
         time_patterns: list[str] = None,
         days_ahead: int = 2,
     ) -> list['Market']:
@@ -275,7 +275,7 @@ class KalshiClient:
         return all_markets
 
     def get_markets(self, event_ticker: str = None, series_ticker: str = None,
-                   status: str = "active", limit: int = 200) -> Optional[list['Market']]:
+                   status: str = "open", limit: int = 200) -> Optional[list['Market']]:
         """Get markets with parsed data.
         Returns None on API error (not empty list) so callers can preserve previous state."""
         params = [f"limit={limit}"]
