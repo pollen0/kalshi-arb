@@ -121,10 +121,10 @@ class TraderConfig:
 
     # ERROR TRACKING (with time decay)
     error_window_seconds: int = 60       # Time window for error counting
-    max_errors_in_window: int = 10       # Max errors in the window before halt
-    max_network_errors: int = 5          # Max network errors in window
-    max_rate_limit_errors: int = 3       # Max rate limit errors in window (more serious)
-    max_order_failures: int = 8          # Max order placement failures in window
+    max_errors_in_window: int = 50       # Max total errors in window before halt
+    max_network_errors: int = 10         # Max network errors in window
+    max_rate_limit_errors: int = 5       # Max rate limit errors in window (more serious)
+    max_order_failures: int = 30         # Max order placement failures in window (rejections are expected)
 
     # FAIR VALUE VALIDATION
     fv_deviation_warn_threshold: float = 0.20   # Warn if FV deviates >20% from market mid
