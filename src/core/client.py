@@ -294,8 +294,8 @@ class KalshiClient:
 
         markets = []
         for m in raw_markets:
-            if status and m.get("status") != status:
-                continue
+            # Server-side status filter already applied via query param — no client-side re-check
+            # (API accepts "open" as filter but response may use different status labels)
 
             # Parse close time
             close_time = None
