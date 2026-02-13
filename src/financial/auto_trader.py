@@ -80,7 +80,7 @@ class TraderConfig:
     price_buffer_cents: int = 1      # Place X cents below fair value
     rebalance_threshold: float = 0.005  # Rebalance if fair value moves 0.5%
     min_volume: int = 0              # Minimum market volume to trade
-    max_fair_value_extreme: float = 0.92  # Skip if fair value > 92% or < 8%
+    max_fair_value_extreme: float = 0.97  # Skip if fair value > 97% or < 3%
     min_price_cents: int = 3         # Don't place orders below 3c
     price_adjust_threshold: int = 2  # Adjust order if optimal price differs by 2c+
 
@@ -95,7 +95,7 @@ class TraderConfig:
     market_making_edge_buffer: float = 0.12  # Place bid at 12% discount from FV (tighter than retail)
     market_making_edge_cents: int = 6       # Absolute cap: max 6c discount from FV
     market_making_max_fv: float = 0.92   # Allow market making up to 92% FV (on that side)
-    market_making_min_fv: float = 0.08   # Allow market making down to 8% FV (below this, trade the other side)
+    market_making_min_fv: float = 0.03   # Allow market making down to 3% FV
 
     # SAFETY LIMITS
     # max_daily_loss_pct is now sourced from RiskConfig (default 5%) for consistency.
@@ -108,7 +108,7 @@ class TraderConfig:
     max_order_age_seconds: int = 180     # Cancel orders older than 3 minutes (stay fresher than retail stale orders)
 
     # DATA QUALITY
-    data_delay_buffer: float = 0.005     # Extra 0.5% edge for data delay
+    data_delay_buffer: float = 0.002     # Extra 0.2% edge for data delay (real-time feed)
 
     # TRANSACTION COSTS
     # These are subtracted from calculated edge before deciding to trade.
@@ -953,17 +953,20 @@ class AutoTrader:
             # MARKET MAKING MODE: Place deep bids on wide-spread markets
             if use_market_making:
                 # Only market make YES if fair value suggests it could settle YES
-                # Min FV check: don't bet on very unlikely outcomes
                 if fair_yes < self.config.market_making_min_fv:
                     return None  # FV too low, YES unlikely to pay out
-                # NOTE: No max FV check - high FV is GOOD for market making
-                # The edge requirement (5-10%) already protects us from overpaying
 
-                # Calculate market making bid: cap discount at absolute cents OR % buffer
-                edge_target = max(
-                    fair_cents - self.config.market_making_edge_cents,  # Caps discount at 6c
-                    int(fair_cents * (1 - self.config.market_making_edge_buffer)),  # 12% floor
-                )
+                # Calculate market making bid
+                # For illiquid markets (spread >= 50), use % buffer only (no 6c cap)
+                # For liquid-ish markets, cap at 6c to stay competitive
+                if spread >= 50:
+                    # No liquidity — use percentage-based pricing only
+                    edge_target = int(fair_cents * (1 - self.config.market_making_edge_buffer))
+                else:
+                    edge_target = max(
+                        fair_cents - self.config.market_making_edge_cents,
+                        int(fair_cents * (1 - self.config.market_making_edge_buffer)),
+                    )
                 # Then ensure we at least beat the existing bid for queue priority
                 mm_bid = max(
                     self.config.min_price_cents,
@@ -978,14 +981,12 @@ class AutoTrader:
                 edge = fair_yes - (mm_bid / 100)
 
                 # Market making has low fill probability but high edge
-                # Use conservative fill probability since we're placing deep
                 fill_prob = self.tracker.predict_fill_probability(market, mm_bid, "yes")
-                fill_prob = max(0.03, min(fill_prob, 0.15))  # Expect 3-15% fills on market making
+                fill_prob = max(0.03, min(fill_prob, 0.15))
 
-                # For market making, tiered edge thresholds based on spread width
-                # Include transaction costs in the threshold
+                # Tiered edge thresholds based on spread width (lowered for better fill rate)
                 txn_cost = self.config.entry_fee_pct + self.config.exit_cost_pct
-                min_mm_edge = (0.03 if spread < 20 else 0.05 if spread < 30 else 0.08) + txn_cost
+                min_mm_edge = (0.02 if spread < 20 else 0.03 if spread < 40 else 0.04) + txn_cost
                 if edge >= min_mm_edge:
                     return (mm_bid, edge, fill_prob)
                 return None
@@ -1028,8 +1029,8 @@ class AutoTrader:
             # Use learned fill probability from historical data
             fill_prob = self.tracker.predict_fill_probability(market, optimal_bid, "yes")
 
-            # Skip if fill probability too low
-            if fill_prob < 0.1:
+            # Skip if fill probability too low (relaxed: limit orders have no downside)
+            if fill_prob < 0.03:
                 return None
 
             # Calculate dynamic minimum edge (accounts for fill prob, adverse selection)
@@ -1050,17 +1051,18 @@ class AutoTrader:
             # MARKET MAKING MODE: Place deep bids on wide-spread markets
             if use_market_making:
                 # Only market make NO if fair value suggests it could settle NO
-                # Min FV check: don't bet on very unlikely outcomes
                 if fair_no < self.config.market_making_min_fv:
                     return None  # FV too low, NO unlikely to pay out
-                # NOTE: No max FV check for NO side - high FV is GOOD for market making
-                # The edge requirement (5-10%) already protects us from overpaying
 
-                # Calculate market making bid for NO side: cap discount at absolute cents OR % buffer
-                edge_target = max(
-                    fair_cents - self.config.market_making_edge_cents,  # Caps discount at 6c
-                    int(fair_cents * (1 - self.config.market_making_edge_buffer)),  # 12% floor
-                )
+                # Calculate market making bid for NO side
+                if spread >= 50:
+                    # No liquidity — use percentage-based pricing only
+                    edge_target = int(fair_cents * (1 - self.config.market_making_edge_buffer))
+                else:
+                    edge_target = max(
+                        fair_cents - self.config.market_making_edge_cents,
+                        int(fair_cents * (1 - self.config.market_making_edge_buffer)),
+                    )
                 # Then ensure we at least beat the existing bid for queue priority
                 mm_bid = max(
                     self.config.min_price_cents,
@@ -1076,12 +1078,11 @@ class AutoTrader:
 
                 # Market making has low fill probability but high edge
                 fill_prob = self.tracker.predict_fill_probability(market, mm_bid, "no")
-                fill_prob = max(0.03, min(fill_prob, 0.15))  # Expect 3-15% fills
+                fill_prob = max(0.03, min(fill_prob, 0.15))
 
-                # For market making, tiered edge thresholds based on spread width
-                # Include transaction costs in the threshold
+                # Tiered edge thresholds based on spread width (lowered for better fill rate)
                 txn_cost = self.config.entry_fee_pct + self.config.exit_cost_pct
-                min_mm_edge = (0.03 if spread < 20 else 0.05 if spread < 30 else 0.08) + txn_cost
+                min_mm_edge = (0.02 if spread < 20 else 0.03 if spread < 40 else 0.04) + txn_cost
                 if edge >= min_mm_edge:
                     return (mm_bid, edge, fill_prob)
                 return None
@@ -1118,7 +1119,8 @@ class AutoTrader:
             # Use learned fill probability from historical data
             fill_prob = self.tracker.predict_fill_probability(market, optimal_bid, "no")
 
-            if fill_prob < 0.1:
+            # Skip if fill probability too low (relaxed: limit orders have no downside)
+            if fill_prob < 0.03:
                 return None
 
             # Calculate dynamic minimum edge (accounts for fill prob, adverse selection)
@@ -1136,10 +1138,10 @@ class AutoTrader:
         if market.fair_value is None:
             return None
 
-        # Reject stale fair values (>15 seconds old)
+        # Reject stale fair values (>30 seconds old)
         if market.fair_value_time:
             fv_age = (datetime.now(timezone.utc) - market.fair_value_time).total_seconds()
-            if fv_age > 15:
+            if fv_age > 30:
                 return None
 
         # Skip if we already have an order on this market
@@ -1925,7 +1927,7 @@ class AutoTrader:
 
             # Track order operations this loop (rate limiting)
             ops_this_loop = 0
-            max_ops_per_loop = 8  # Stay under Kalshi's 10 writes/sec
+            max_ops_per_loop = 12  # Budget for cancels + new orders per loop
 
             # VIX-based dynamic order scaling
             effective_max_orders = self.config.max_total_orders
@@ -2023,7 +2025,7 @@ class AutoTrader:
                     opportunities.append((market, side, price, edge, fill_prob, ev))
                 elif market.fair_value is None:
                     skipped_markets["no_fv"] += 1
-                elif market.fair_value_time and (now - market.fair_value_time).total_seconds() > 15:
+                elif market.fair_value_time and (now - market.fair_value_time).total_seconds() > 30:
                     skipped_markets["stale_fv"] += 1
                 else:
                     skipped_markets["no_edge"] += 1

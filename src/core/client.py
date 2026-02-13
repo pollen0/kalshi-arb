@@ -273,26 +273,42 @@ class KalshiClient:
                 time_patterns = [""]
             elif series_prefix in ["KXBTCD", "KXETHD", "KXSOLD", "KXDOGED", "KXXRPD"]:
                 time_patterns = [""]
-            elif series_prefix in ["KXBTC", "KXETH", "KXSOL", "KXDOGE", "KXXRP",
-                                   "KXBTC15M", "KXETH15M", "KXSOL15M", "KXDOGE15M", "KXXRP15M"]:
-                time_patterns = None  # High-frequency — rely on API discovery only
+            elif series_prefix in ["KXBTC", "KXETH", "KXSOL", "KXDOGE", "KXXRP"]:
+                # Hourly crypto: generate patterns for the next 6 hours
+                current_hour = now.hour
+                time_patterns = [f"H{(current_hour + h) % 24:02d}00" for h in range(6)]
+            elif series_prefix in ["KXBTC15M", "KXETH15M", "KXSOL15M", "KXDOGE15M", "KXXRP15M"]:
+                # 15-min crypto: generate patterns for the next 2 hours in 15-min increments
+                current_hour = now.hour
+                current_quarter = (now.minute // 15 + 1) * 15  # Next 15-min slot
+                time_patterns = []
+                for i in range(8):
+                    total_min = current_quarter + 15 * i
+                    h = (current_hour + total_min // 60) % 24
+                    m = total_min % 60
+                    time_patterns.append(f"H{h:02d}{m:02d}")
             else:
                 time_patterns = ["H1600", ""]
 
         # --- Step 1: Direct series_ticker query (single API call) ---
+        step1_result = None
         try:
             direct_markets = self.get_markets(series_ticker=series_prefix, status=None, limit=1000)
+            step1_result = f"{len(direct_markets)} total" if direct_markets else "0 results"
             if direct_markets:
                 active = [m for m in direct_markets if m.close_time and m.close_time > now]
+                step1_result += f", {len(active)} active"
                 if active:
                     print(f"[CLIENT] {series_prefix}: {len(active)} active markets via series_ticker")
                     return active
         except Exception as e:
-            print(f"[CLIENT] Series query failed for {series_prefix}: {e}")
+            step1_result = f"error: {e}"
 
         # --- Step 2: Events API (N+1 calls, but reliable) ---
+        step2_result = None
         try:
             events = self.get_events(series_ticker=series_prefix, limit=200)
+            step2_result = f"{len(events)} events" if events else "0 events"
             if events:
                 all_markets = []
                 for event in events:
@@ -304,29 +320,37 @@ class KalshiClient:
                         all_markets.extend(markets)
 
                 active = [m for m in all_markets if m.close_time and m.close_time > now]
+                step2_result += f" → {len(all_markets)} markets, {len(active)} active"
                 if active:
                     print(f"[CLIENT] {series_prefix}: {len(active)} active markets via events API")
                     return active
         except Exception as e:
-            print(f"[CLIENT] Events API failed for {series_prefix}: {e}")
+            step2_result = f"error: {e}"
 
         # --- Step 3: Pattern-based event ticker generation (last resort) ---
         if time_patterns is None:
+            print(f"[CLIENT] {series_prefix}: No markets found (step1={step1_result}, step2={step2_result}, no patterns)")
             return []
 
         all_markets = []
+        patterns_tried = 0
         for day_offset in range(days_ahead + 1):
             date = now + timedelta(days=day_offset)
             date_str = date.strftime("%y%b%d").upper()
 
             for time_suffix in time_patterns:
                 event_ticker = f"{series_prefix}-{date_str}{time_suffix}"
+                patterns_tried += 1
                 markets = self.get_markets(event_ticker=event_ticker, status=None)
                 if markets:
                     active = [m for m in markets if m.close_time and m.close_time > now]
                     if active:
                         all_markets.extend(active)
                         print(f"[CLIENT] Found {len(active)} markets for {event_ticker}")
+
+        if not all_markets:
+            print(f"[CLIENT] {series_prefix}: No markets found "
+                  f"(step1={step1_result}, step2={step2_result}, step3: {patterns_tried} patterns tried)")
 
         return all_markets
 
