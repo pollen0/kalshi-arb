@@ -291,6 +291,12 @@ class MarketDiscovery:
         """
         Find all active expiration slots across all series.
 
+        Uses the Events API for efficient discovery (1 API call per series)
+        instead of probing individual event tickers.
+
+        Auto-rolls forward: expired slots are evicted, and new events are
+        discovered on each refresh cycle.
+
         Args:
             series_prefixes: List of prefixes to check (default: all known)
             days_ahead: How many days ahead to look
@@ -299,32 +305,108 @@ class MarketDiscovery:
         Returns:
             List of ExpirationSlot objects sorted by expiry time
         """
-        # Check cache
         now = datetime.now(timezone.utc)
+
+        # Check cache — also invalidate if any cached slot has expired (roll forward)
         if (
             not force_refresh
             and self._last_discovery
             and (now - self._last_discovery).total_seconds() < self._cache_ttl_seconds
         ):
-            return list(self._slot_cache.values())
+            # Check if any slot just expired — if so, force refresh to roll forward
+            any_expired = any(
+                slot.close_time and slot.close_time <= now
+                for slot in self._slot_cache.values()
+            )
+            if not any_expired:
+                return [s for s in self._slot_cache.values() if not s.is_expired]
 
         if series_prefixes is None:
             series_prefixes = list(self.SERIES_ASSET_CLASS.keys())
 
         discovered_slots: Dict[str, ExpirationSlot] = {}
 
+        # Group prefixes by unique series to avoid redundant API calls
+        seen_series = set()
         for series_prefix in series_prefixes:
-            event_tickers = self._generate_event_tickers(series_prefix, days_ahead)
+            if series_prefix in seen_series:
+                continue
+            seen_series.add(series_prefix)
 
+            # Try Events API first (1 call per series vs N calls for pattern probing)
+            try:
+                events = self.client.get_events(series_ticker=series_prefix, limit=200)
+                if events:
+                    for event in events:
+                        event_ticker = event.get("event_ticker", "")
+                        if not event_ticker or event_ticker in discovered_slots:
+                            continue
+
+                        # Parse close time from event data if available
+                        close_time = None
+                        close_str = event.get("close_time") or event.get("end_date")
+                        if close_str:
+                            try:
+                                close_time = datetime.fromisoformat(close_str.replace('Z', '+00:00'))
+                            except (ValueError, AttributeError):
+                                pass
+
+                        # Skip events that already expired
+                        if close_time and close_time <= now:
+                            continue
+
+                        # Parse date/time from event ticker
+                        parts = event_ticker.split("-")
+                        if len(parts) < 2:
+                            continue
+
+                        date_part = parts[1]
+                        time_suffix = ""
+                        for pattern in ["H1000", "H1200", "H1600", "10"]:
+                            if date_part.endswith(pattern):
+                                time_suffix = pattern
+                                date_part = date_part[:-len(pattern)]
+                                break
+
+                        try:
+                            date = datetime.strptime(date_part, "%y%b%d").replace(tzinfo=timezone.utc)
+                        except ValueError:
+                            continue
+
+                        # Use close_time from event, or estimate it
+                        if not close_time:
+                            close_time = self._estimate_close_time(date, time_suffix)
+
+                        # Skip if estimated close is in the past
+                        if close_time <= now:
+                            continue
+
+                        market_count = event.get("market_count") or event.get("markets_count") or 0
+
+                        slot = ExpirationSlot(
+                            series_prefix=series_prefix,
+                            event_ticker=event_ticker,
+                            date=date,
+                            time_suffix=time_suffix,
+                            market_count=market_count,
+                            close_time=close_time,
+                        )
+                        discovered_slots[event_ticker] = slot
+
+                    if any(s.series_prefix == series_prefix for s in discovered_slots.values()):
+                        continue  # Events API worked, skip pattern fallback
+
+            except Exception as e:
+                print(f"[DISCOVERY] Events API failed for {series_prefix}: {e}")
+
+            # Fallback: pattern-based probing (only if events API found nothing)
+            event_tickers = self._generate_event_tickers(series_prefix, days_ahead)
             for event_ticker in event_tickers:
-                # Skip if we already discovered this slot
                 if event_ticker in discovered_slots:
                     continue
-
                 slot = self.discover_slot(series_prefix, event_ticker)
-                if slot and slot.market_count > 0:
+                if slot and slot.market_count > 0 and not slot.is_expired:
                     discovered_slots[event_ticker] = slot
-                    print(f"[DISCOVERY] Found {slot.market_count} markets: {slot.display_name}")
 
         # Update cache
         self._slot_cache = discovered_slots
@@ -333,6 +415,9 @@ class MarketDiscovery:
         # Sort by expiry time
         slots = list(discovered_slots.values())
         slots.sort(key=lambda s: s.close_time or datetime.max.replace(tzinfo=timezone.utc))
+
+        if slots:
+            print(f"[DISCOVERY] {len(slots)} active slots across {len(seen_series)} series")
 
         return slots
 

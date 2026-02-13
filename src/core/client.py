@@ -42,6 +42,10 @@ class KalshiClient:
         self._last_write = 0
         self._rate_lock = threading.Lock()
 
+        # Market discovery cache: {series_prefix: {"markets": [...], "fetched_at": datetime, "next_expiry": datetime}}
+        self._series_cache = {}
+        self._series_cache_lock = threading.Lock()
+
     def _rate_limit(self, is_write: bool = False):
         """Thread-safe rate limiting with separate read/write budgets.
 
@@ -188,13 +192,16 @@ class KalshiClient:
         """
         Get markets by series prefix (e.g., 'KXINXU', 'KXNASDAQ100U').
 
-        Uses a 3-step discovery approach:
-        1. Events API with series_ticker filter (most reliable)
-        2. Direct series_ticker query on markets endpoint
-        3. Pattern-based event ticker generation (fallback)
+        Uses a cached 3-step discovery approach:
+        1. Direct series_ticker query (single API call, most efficient)
+        2. Events API with series_ticker filter (reliable fallback)
+        3. Pattern-based event ticker generation (last resort)
 
-        All queries run WITHOUT status filter to avoid API compatibility issues.
-        Results are filtered client-side (close_time in the future).
+        Results are cached per series_prefix. Cache auto-invalidates when:
+        - The nearest market expires (triggers roll-forward to next slot)
+        - 90 seconds have elapsed (periodic refresh)
+
+        All queries run WITHOUT status filter. Results filtered client-side.
 
         Args:
             series_prefix: The series prefix (e.g., 'KXINXU', 'KXNASDAQ100U')
@@ -207,33 +214,83 @@ class KalshiClient:
         """
         now = datetime.now(timezone.utc)
 
+        # --- Check cache first ---
+        with self._series_cache_lock:
+            cached = self._series_cache.get(series_prefix)
+            if cached:
+                age = (now - cached["fetched_at"]).total_seconds()
+                next_exp = cached["next_expiry"]
+
+                # Determine if cache is still valid
+                # Invalidate if: >90s old OR nearest market has expired (roll forward)
+                needs_refresh = age > 90
+                if next_exp and next_exp <= now:
+                    needs_refresh = True  # A market just expired — roll forward
+
+                if not needs_refresh:
+                    # Return cached, but strip any that expired since caching
+                    active = [m for m in cached["markets"] if m.close_time and m.close_time > now]
+                    if active:
+                        return active
+                    # All cached markets expired — force refresh
+
+        # --- Fetch fresh data ---
+        markets = self._fetch_series_markets(series_prefix, time_patterns, days_ahead, now)
+
+        # --- Update cache ---
+        if markets:
+            next_expiry = min(
+                (m.close_time for m in markets if m.close_time),
+                default=now + timedelta(hours=24),
+            )
+            with self._series_cache_lock:
+                self._series_cache[series_prefix] = {
+                    "markets": markets,
+                    "fetched_at": now,
+                    "next_expiry": next_expiry,
+                }
+
+        return markets
+
+    def _fetch_series_markets(
+        self,
+        series_prefix: str,
+        time_patterns: list[str],
+        days_ahead: int,
+        now: datetime,
+    ) -> list['Market']:
+        """Internal: fetch markets for a series prefix using 3-step discovery."""
+
         # Determine time patterns based on series prefix if not provided
         if time_patterns is None:
-            # Equity indices: H1000, H1200, H1600
             if series_prefix in ["KXINXU", "KXINX", "KXNASDAQ100U", "KXNASDAQ100"]:
                 time_patterns = ["H1000", "H1200", "H1600"]
-            # Forex: "10" suffix (NOT "H1000")
             elif series_prefix in ["KXEURUSD", "KXUSDJPY"]:
                 time_patterns = ["10"]
-            # Treasury: EOD only
             elif series_prefix in ["KXTNOTED"]:
                 time_patterns = [""]
-            # WTI Crude Oil: EOD only
             elif series_prefix in ["KXWTI", "KXWTIW"]:
                 time_patterns = [""]
-            # Crypto: daily series have no suffix, hourly/15min use dynamic discovery
             elif series_prefix in ["KXBTCD", "KXETHD", "KXSOLD", "KXDOGED", "KXXRPD"]:
                 time_patterns = [""]
             elif series_prefix in ["KXBTC", "KXETH", "KXSOL", "KXDOGE", "KXXRP",
                                    "KXBTC15M", "KXETH15M", "KXSOL15M", "KXDOGE15M", "KXXRP15M"]:
-                # Hourly/15-min crypto: many expirations per day, rely on events/series query
-                time_patterns = None
+                time_patterns = None  # High-frequency — rely on API discovery only
             else:
-                # Default: try H1600 and empty
                 time_patterns = ["H1600", ""]
 
-        # --- Step 1: Events API (most reliable) ---
-        # Query events by series_ticker without status filter
+        # --- Step 1: Direct series_ticker query (single API call) ---
+        try:
+            direct_markets = self.get_markets(series_ticker=series_prefix, status=None, limit=1000)
+            if direct_markets:
+                active = [m for m in direct_markets if m.close_time and m.close_time > now]
+                if active:
+                    print(f"[CLIENT] {series_prefix}: {len(active)} active markets via series_ticker")
+                    return active
+        except Exception as e:
+            print(f"[CLIENT] Series query failed for {series_prefix}: {e}")
+
+        # --- Step 2: Events API (N+1 calls, but reliable) ---
         try:
             events = self.get_events(series_ticker=series_prefix, limit=200)
             if events:
@@ -246,46 +303,30 @@ class KalshiClient:
                     if markets:
                         all_markets.extend(markets)
 
-                # Filter: only keep markets with close_time in the future
-                all_markets = [m for m in all_markets if m.close_time and m.close_time > now]
-                if all_markets:
-                    print(f"[CLIENT] {series_prefix}: Found {len(all_markets)} markets via events API")
-                    return all_markets
+                active = [m for m in all_markets if m.close_time and m.close_time > now]
+                if active:
+                    print(f"[CLIENT] {series_prefix}: {len(active)} active markets via events API")
+                    return active
         except Exception as e:
             print(f"[CLIENT] Events API failed for {series_prefix}: {e}")
 
-        # --- Step 2: Direct series_ticker query on markets endpoint ---
-        try:
-            direct_markets = self.get_markets(series_ticker=series_prefix, status=None, limit=1000)
-            if direct_markets:
-                direct_markets = [m for m in direct_markets if m.close_time and m.close_time > now]
-                if direct_markets:
-                    print(f"[CLIENT] {series_prefix}: Found {len(direct_markets)} markets via series_ticker")
-                    return direct_markets
-        except Exception as e:
-            print(f"[CLIENT] Series query failed for {series_prefix}: {e}")
-
-        # --- Step 3: Pattern-based event ticker generation (fallback) ---
+        # --- Step 3: Pattern-based event ticker generation (last resort) ---
         if time_patterns is None:
-            # No known patterns (e.g., high-frequency crypto) — previous steps were our only hope
             return []
 
         all_markets = []
         for day_offset in range(days_ahead + 1):
             date = now + timedelta(days=day_offset)
-            date_str = date.strftime("%y%b%d").upper()  # e.g., "26FEB13"
+            date_str = date.strftime("%y%b%d").upper()
 
             for time_suffix in time_patterns:
                 event_ticker = f"{series_prefix}-{date_str}{time_suffix}"
-
-                # Fetch without status filter
                 markets = self.get_markets(event_ticker=event_ticker, status=None)
                 if markets:
-                    # Filter by close_time
-                    markets = [m for m in markets if m.close_time and m.close_time > now]
-                    if markets:
-                        all_markets.extend(markets)
-                        print(f"[CLIENT] Found {len(markets)} markets for {event_ticker}")
+                    active = [m for m in markets if m.close_time and m.close_time > now]
+                    if active:
+                        all_markets.extend(active)
+                        print(f"[CLIENT] Found {len(active)} markets for {event_ticker}")
 
         return all_markets
 
