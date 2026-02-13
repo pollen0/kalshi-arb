@@ -227,7 +227,7 @@ class MarketDiscovery:
             ExpirationSlot if markets exist, None otherwise
         """
         try:
-            markets = self.client.get_markets(event_ticker=event_ticker, status="open")
+            markets = self.client.get_markets(event_ticker=event_ticker)
 
             if not markets:
                 return None
@@ -390,8 +390,7 @@ class MarketDiscovery:
         """
         try:
             return self.client.get_markets(
-                event_ticker=slot.event_ticker,
-                status="open"
+                event_ticker=slot.event_ticker
             )
         except Exception as e:
             print(f"[DISCOVERY] Error fetching markets for {slot.event_ticker}: {e}")

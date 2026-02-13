@@ -167,9 +167,11 @@ class KalshiClient:
 
     # === Market Methods ===
 
-    def get_events(self, series_ticker: str = None, status: str = "open", limit: int = 100) -> list:
+    def get_events(self, series_ticker: str = None, status: str = None, limit: int = 100) -> list:
         """Get events, optionally filtered by series"""
-        params = [f"status={status}", f"limit={limit}"]
+        params = [f"limit={limit}"]
+        if status:
+            params.append(f"status={status}")
         if series_ticker:
             params.append(f"series_ticker={series_ticker}")
 
@@ -179,28 +181,31 @@ class KalshiClient:
     def get_markets_by_series_prefix(
         self,
         series_prefix: str,
-        status: str = "open",
+        status: str = None,
         time_patterns: list[str] = None,
         days_ahead: int = 2,
     ) -> list['Market']:
         """
         Get markets by series prefix (e.g., 'KXINXU', 'KXNASDAQ100U').
 
-        This works by:
-        1. Finding active event tickers that start with the prefix
-        2. Fetching markets for each event
+        Uses a 3-step discovery approach:
+        1. Events API with series_ticker filter (most reliable)
+        2. Direct series_ticker query on markets endpoint
+        3. Pattern-based event ticker generation (fallback)
+
+        All queries run WITHOUT status filter to avoid API compatibility issues.
+        Results are filtered client-side (close_time in the future).
 
         Args:
             series_prefix: The series prefix (e.g., 'KXINXU', 'KXNASDAQ100U')
-            status: Market status filter ('active', 'closed', etc.)
+            status: Ignored (kept for caller compatibility). Filtering is done client-side.
             time_patterns: Optional list of time suffixes to check (e.g., ['H1200', 'H1600'])
-                          If None, uses default patterns based on asset class.
             days_ahead: How many days ahead to check for events
 
         Returns:
             List of Market objects from all matching events
         """
-        all_markets = []
+        now = datetime.now(timezone.utc)
 
         # Determine time patterns based on series prefix if not provided
         if time_patterns is None:
@@ -221,61 +226,71 @@ class KalshiClient:
                 time_patterns = [""]
             elif series_prefix in ["KXBTC", "KXETH", "KXSOL", "KXDOGE", "KXXRP",
                                    "KXBTC15M", "KXETH15M", "KXSOL15M", "KXDOGE15M", "KXXRP15M"]:
-                # Hourly/15-min crypto: many expirations per day, use bulk discovery
-                time_patterns = None  # Signal to skip pattern generation and rely on bulk query
+                # Hourly/15-min crypto: many expirations per day, rely on events/series query
+                time_patterns = None
             else:
                 # Default: try H1600 and empty
                 time_patterns = ["H1600", ""]
 
-        # Get a large batch of markets and find matching event tickers
-        result = self._request("GET", "/markets?limit=1000")
-        if result.get("error"):
-            print(f"[CLIENT] Error fetching bulk markets: {result.get('message', 'Unknown')}")
-            return None
-        raw_markets = result.get("markets", []) if isinstance(result, dict) else []
+        # --- Step 1: Events API (most reliable) ---
+        # Query events by series_ticker without status filter
+        try:
+            events = self.get_events(series_ticker=series_prefix, limit=200)
+            if events:
+                all_markets = []
+                for event in events:
+                    event_ticker = event.get("event_ticker", "")
+                    if not event_ticker:
+                        continue
+                    markets = self.get_markets(event_ticker=event_ticker, status=None)
+                    if markets:
+                        all_markets.extend(markets)
 
-        # Find unique event tickers that match our prefix
-        event_tickers = set()
-        for m in raw_markets:
-            ticker = m.get("ticker", "")
-            event = m.get("event_ticker", "")
-            if ticker.startswith(series_prefix) or event.startswith(series_prefix):
-                event_tickers.add(event)
+                # Filter: only keep markets with close_time in the future
+                all_markets = [m for m in all_markets if m.close_time and m.close_time > now]
+                if all_markets:
+                    print(f"[CLIENT] {series_prefix}: Found {len(all_markets)} markets via events API")
+                    return all_markets
+        except Exception as e:
+            print(f"[CLIENT] Events API failed for {series_prefix}: {e}")
 
-        # If we didn't find any from the general query, try known patterns
-        if not event_tickers:
-            if time_patterns is None:
-                # No known patterns (e.g., high-frequency crypto) — bulk query only
-                return all_markets
+        # --- Step 2: Direct series_ticker query on markets endpoint ---
+        try:
+            direct_markets = self.get_markets(series_ticker=series_prefix, status=None, limit=1000)
+            if direct_markets:
+                direct_markets = [m for m in direct_markets if m.close_time and m.close_time > now]
+                if direct_markets:
+                    print(f"[CLIENT] {series_prefix}: Found {len(direct_markets)} markets via series_ticker")
+                    return direct_markets
+        except Exception as e:
+            print(f"[CLIENT] Series query failed for {series_prefix}: {e}")
 
-            # Generate event tickers for multiple days with all time patterns
-            now = datetime.now(timezone.utc)
+        # --- Step 3: Pattern-based event ticker generation (fallback) ---
+        if time_patterns is None:
+            # No known patterns (e.g., high-frequency crypto) — previous steps were our only hope
+            return []
 
-            for day_offset in range(days_ahead + 1):
-                date = now + timedelta(days=day_offset)
-                date_str = date.strftime("%y%b%d").upper()  # e.g., "26FEB04"
+        all_markets = []
+        for day_offset in range(days_ahead + 1):
+            date = now + timedelta(days=day_offset)
+            date_str = date.strftime("%y%b%d").upper()  # e.g., "26FEB13"
 
-                for time_suffix in time_patterns:
-                    event_ticker = f"{series_prefix}-{date_str}{time_suffix}"
+            for time_suffix in time_patterns:
+                event_ticker = f"{series_prefix}-{date_str}{time_suffix}"
 
-                    # Try to fetch markets for this event
-                    markets = self.get_markets(event_ticker=event_ticker, status=status)
-                    if markets is not None and len(markets) > 0:
+                # Fetch without status filter
+                markets = self.get_markets(event_ticker=event_ticker, status=None)
+                if markets:
+                    # Filter by close_time
+                    markets = [m for m in markets if m.close_time and m.close_time > now]
+                    if markets:
                         all_markets.extend(markets)
                         print(f"[CLIENT] Found {len(markets)} markets for {event_ticker}")
-
-            return all_markets
-
-        # Fetch markets for each event found in the general query
-        for event in event_tickers:
-            markets = self.get_markets(event_ticker=event, status=status)
-            if markets is not None:
-                all_markets.extend(markets)
 
         return all_markets
 
     def get_markets(self, event_ticker: str = None, series_ticker: str = None,
-                   status: str = "open", limit: int = 200) -> Optional[list['Market']]:
+                   status: str = None, limit: int = 200) -> Optional[list['Market']]:
         """Get markets with parsed data.
         Returns None on API error (not empty list) so callers can preserve previous state."""
         params = [f"limit={limit}"]
