@@ -29,6 +29,7 @@ ET = ZoneInfo("America/New_York")
 
 INSIGHTSENTRY_BASE = "https://insightsentry.p.rapidapi.com"
 BINANCE_BASE = "https://api.binance.com"
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
 
 class FuturesClient:
@@ -52,6 +53,15 @@ class FuturesClient:
         "solana": "SOLUSDT",
         "dogecoin": "DOGEUSDT",
         "xrp": "XRPUSDT",
+    }
+
+    # CoinGecko IDs (fallback when Binance is geo-blocked)
+    COINGECKO_IDS = {
+        "bitcoin": "bitcoin",
+        "ethereum": "ethereum",
+        "solana": "solana",
+        "dogecoin": "dogecoin",
+        "xrp": "ripple",
     }
 
     # InsightSentry futures symbols (for overnight basis adjustment)
@@ -542,7 +552,7 @@ class FuturesClient:
     # ========================================================================
 
     def _fetch_binance_prices(self) -> dict[str, FuturesQuote]:
-        """Fetch all crypto prices from Binance in a single API call."""
+        """Fetch all crypto prices from Binance, falling back to CoinGecko if blocked."""
         symbols = list(self.BINANCE_TICKERS.values())
         reverse_map = {v: k for k, v in self.BINANCE_TICKERS.items()}
 
@@ -552,9 +562,12 @@ class FuturesClient:
                 params={"symbols": json.dumps(symbols)},
                 timeout=8,
             )
+            if resp.status_code == 451 or resp.status_code == 403:
+                # Geo-blocked — fall back to CoinGecko silently
+                return self._fetch_coingecko_prices()
             if resp.status_code != 200:
                 print(f"[BINANCE] HTTP {resp.status_code}")
-                return {}
+                return self._fetch_coingecko_prices()
 
             data = resp.json()
             quotes = {}
@@ -575,24 +588,72 @@ class FuturesClient:
                     change_pct=float(item.get("priceChangePercent", 0)),
                 )
                 quotes[key] = quote
-                self._set_cached(f"BINANCE:{symbol}", quote)
+                self._set_cached(f"CRYPTO:{key}", quote)
 
             return quotes
 
         except Exception as e:
-            print(f"[BINANCE] Error: {e}")
+            print(f"[BINANCE] Error: {e}, falling back to CoinGecko")
+            return self._fetch_coingecko_prices()
+
+    def _fetch_coingecko_prices(self) -> dict[str, FuturesQuote]:
+        """Fetch all crypto prices from CoinGecko (works from US servers)."""
+        ids = ",".join(self.COINGECKO_IDS.values())
+        reverse_map = {v: k for k, v in self.COINGECKO_IDS.items()}
+
+        try:
+            resp = requests.get(
+                f"{COINGECKO_BASE}/simple/price",
+                params={
+                    "ids": ids,
+                    "vs_currencies": "usd",
+                    "include_24hr_change": "true",
+                },
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                print(f"[COINGECKO] HTTP {resp.status_code}")
+                return {}
+
+            data = resp.json()
+            quotes = {}
+            for cg_id, values in data.items():
+                key = reverse_map.get(cg_id)
+                if not key:
+                    continue
+
+                price = values.get("usd", 0)
+                if price <= 0:
+                    continue
+
+                change_pct = values.get("usd_24h_change", 0) or 0
+                quote = FuturesQuote(
+                    symbol=cg_id.upper(),
+                    price=price,
+                    change=0,  # CoinGecko doesn't give absolute change easily
+                    change_pct=change_pct,
+                )
+                quotes[key] = quote
+                self._set_cached(f"CRYPTO:{key}", quote)
+
+            if quotes:
+                print(f"[COINGECKO] Fetched {len(quotes)} crypto prices")
+            return quotes
+
+        except Exception as e:
+            print(f"[COINGECKO] Error: {e}")
             return {}
 
     def _fetch_single_binance_quote(self, index: str) -> Optional[FuturesQuote]:
-        """Fetch a single crypto quote from Binance."""
+        """Fetch a single crypto quote from Binance, with CoinGecko fallback."""
+        # Check cache first
+        cached = self._get_cached(f"CRYPTO:{index}")
+        if cached:
+            return cached
+
         symbol = self.BINANCE_TICKERS.get(index)
         if not symbol:
             return None
-
-        # Check cache
-        cached = self._get_cached(f"BINANCE:{symbol}")
-        if cached:
-            return cached
 
         try:
             resp = requests.get(
@@ -600,8 +661,11 @@ class FuturesClient:
                 params={"symbol": symbol},
                 timeout=8,
             )
+            if resp.status_code in (451, 403):
+                # Geo-blocked — use CoinGecko
+                return self._fetch_single_coingecko_quote(index)
             if resp.status_code != 200:
-                return None
+                return self._fetch_single_coingecko_quote(index)
 
             item = resp.json()
             price = float(item.get("lastPrice", 0))
@@ -614,11 +678,52 @@ class FuturesClient:
                 change=float(item.get("priceChange", 0)),
                 change_pct=float(item.get("priceChangePercent", 0)),
             )
-            self._set_cached(f"BINANCE:{symbol}", quote)
+            self._set_cached(f"CRYPTO:{index}", quote)
             return quote
 
         except Exception as e:
-            print(f"[BINANCE] Error fetching {symbol}: {e}")
+            return self._fetch_single_coingecko_quote(index)
+
+    def _fetch_single_coingecko_quote(self, index: str) -> Optional[FuturesQuote]:
+        """Fetch a single crypto quote from CoinGecko."""
+        cg_id = self.COINGECKO_IDS.get(index)
+        if not cg_id:
+            return None
+
+        cached = self._get_cached(f"CRYPTO:{index}")
+        if cached:
+            return cached
+
+        try:
+            resp = requests.get(
+                f"{COINGECKO_BASE}/simple/price",
+                params={
+                    "ids": cg_id,
+                    "vs_currencies": "usd",
+                    "include_24hr_change": "true",
+                },
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return None
+
+            data = resp.json()
+            values = data.get(cg_id, {})
+            price = values.get("usd", 0)
+            if price <= 0:
+                return None
+
+            quote = FuturesQuote(
+                symbol=cg_id.upper(),
+                price=price,
+                change=0,
+                change_pct=values.get("usd_24h_change", 0) or 0,
+            )
+            self._set_cached(f"CRYPTO:{index}", quote)
+            return quote
+
+        except Exception as e:
+            print(f"[COINGECKO] Error fetching {cg_id}: {e}")
             return None
 
     # ========================================================================
