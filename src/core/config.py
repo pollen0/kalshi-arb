@@ -13,76 +13,6 @@ from typing import Optional
 _CONFIG_FILE = os.path.join(os.path.dirname(__file__), "..", "..", "data", "trading_config.json")
 
 
-@dataclass
-class SettlementConfig:
-    """Configuration for settlement instruments and pricing sources"""
-
-    # Use cash index (not futures) for settlement reference
-    # Kalshi settles to the cash index, not futures
-    use_index_for_settlement: bool = True
-
-    # Settlement instruments by Kalshi series
-    # These are the actual instruments Kalshi settles to
-    settlement_instruments: dict = field(default_factory=lambda: {
-        # NASDAQ-100 markets settle to ^NDX (cash index)
-        "KXNASDAQ100": "^NDX",
-        "KXNASDAQ100U": "^NDX",
-        # S&P 500 markets settle to ^GSPC (cash index)
-        "KXINX": "^GSPC",
-        "KXINXU": "^GSPC",
-        # Treasury settles to actual yield
-        "KXTNOTED": "^TNX",
-        # WTI Crude Oil
-        "KXWTI": "CL=F",
-        "KXWTIW": "CL=F",
-        # Crypto — settles to CF Benchmarks Real-Time Index
-        "KXBTC": "BTC-USD",
-        "KXBTC15M": "BTC-USD",
-        "KXBTCD": "BTC-USD",
-        "KXETH": "ETH-USD",
-        "KXETH15M": "ETH-USD",
-        "KXETHD": "ETH-USD",
-        "KXSOL": "SOL-USD",
-        "KXSOL15M": "SOL-USD",
-        "KXSOLD": "SOL-USD",
-        "KXDOGE": "DOGE-USD",
-        "KXDOGE15M": "DOGE-USD",
-        "KXDOGED": "DOGE-USD",
-        "KXXRP": "XRP-USD",
-        "KXXRP15M": "XRP-USD",
-        "KXXRPD": "XRP-USD",
-    })
-
-    # Futures symbols for real-time price tracking
-    # These trade when markets are closed and provide price discovery
-    futures_symbols: dict = field(default_factory=lambda: {
-        "nasdaq": "NQ=F",    # E-mini NASDAQ-100 futures
-        "spx": "ES=F",       # E-mini S&P 500 futures
-        "dow": "YM=F",       # E-mini Dow futures
-        "russell": "RTY=F",  # E-mini Russell 2000 futures
-    })
-
-    # Cash index symbols (what Kalshi actually settles to)
-    index_symbols: dict = field(default_factory=lambda: {
-        "nasdaq": "^NDX",    # NASDAQ-100 Index
-        "spx": "^GSPC",      # S&P 500 Index
-        "dow": "^DJI",       # Dow Jones Industrial Average
-        "russell": "^RUT",   # Russell 2000 Index
-    })
-
-    # Options symbols for implied volatility
-    options_symbols: dict = field(default_factory=lambda: {
-        "nasdaq": "QQQ",     # NASDAQ-100 ETF options (most liquid)
-        "spx": "SPY",        # S&P 500 ETF options (most liquid)
-        # Can also use SPX/NDX index options but less liquid for 0DTE
-    })
-
-    # VIX and volatility indices
-    volatility_indices: dict = field(default_factory=lambda: {
-        "vix": "^VIX",       # S&P 500 implied volatility
-        "vxn": "^VXN",       # NASDAQ-100 implied volatility
-    })
-
 
 @dataclass
 class AssetClassConfig:
@@ -171,50 +101,10 @@ class RiskConfig:
     max_price_staleness_seconds: float = 5.0    # Reject prices older than 5 seconds
 
 
-@dataclass
-class ModelConfig:
-    """Fair value model configuration"""
-
-    # Distribution settings
-    use_fat_tails: bool = True                  # Use Student's t instead of normal
-    tail_degrees_of_freedom: int = 5            # df for Student's t (lower = fatter tails)
-
-    # Volatility sources (in order of preference)
-    volatility_preference: list = field(default_factory=lambda: [
-        "options_implied",      # 1st: Options-implied volatility
-        "vix_scaled",           # 2nd: VIX-based estimate
-        "historical",           # 3rd: Historical volatility
-        "default",              # 4th: Default assumptions
-    ])
-
-    # Options-based model settings
-    use_options_skew: bool = True               # Apply put-call skew adjustment
-    use_options_implied_distribution: bool = True  # Use risk-neutral probabilities from options
-
-    # Minimum data requirements
-    min_options_volume: int = 100               # Min volume for option quotes to be valid
-    min_options_open_interest: int = 500        # Min OI for option quotes
-
-    # Sanity checks
-    max_fair_value_deviation: float = 0.25      # Max 25% deviation from market mid
-
-
 # Global configuration instances
-_settlement_config: Optional[SettlementConfig] = None
 _asset_class_config: Optional[AssetClassConfig] = None
 _risk_config: Optional[RiskConfig] = None
-_model_config: Optional[ModelConfig] = None
 _config_lock = threading.Lock()
-
-
-def get_settlement_config() -> SettlementConfig:
-    """Get global settlement configuration"""
-    global _settlement_config
-    if _settlement_config is None:
-        with _config_lock:
-            if _settlement_config is None:
-                _settlement_config = SettlementConfig()
-    return _settlement_config
 
 
 def get_asset_class_config() -> AssetClassConfig:
@@ -302,9 +192,3 @@ def load_config():
         print(f"[CONFIG] Failed to load config: {e}")
 
 
-def get_model_config() -> ModelConfig:
-    """Get global model configuration"""
-    global _model_config
-    if _model_config is None:
-        _model_config = ModelConfig()
-    return _model_config

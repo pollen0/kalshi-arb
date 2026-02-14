@@ -463,12 +463,8 @@ class KalshiClient:
             return MarketType.FINANCIAL_ABOVE
         elif "below" in title:
             return MarketType.FINANCIAL_BELOW
-        elif any(x in title for x in ["spread", "handicap", "pts", "+/-"]):
-            return MarketType.SPORTS_SPREAD
-        elif any(x in title for x in ["over", "under", "total", "o/u"]):
-            return MarketType.SPORTS_TOTAL
         else:
-            return MarketType.SPORTS_MONEYLINE
+            return MarketType.FINANCIAL_RANGE  # Default for unrecognized markets
 
     def _parse_bounds(self, title: str) -> tuple:
         """Parse range bounds from title"""

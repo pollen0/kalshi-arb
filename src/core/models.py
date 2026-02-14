@@ -9,9 +9,6 @@ from enum import Enum
 
 
 class MarketType(Enum):
-    SPORTS_MONEYLINE = "moneyline"
-    SPORTS_SPREAD = "spread"
-    SPORTS_TOTAL = "total"
     FINANCIAL_RANGE = "range"
     FINANCIAL_ABOVE = "above"
     FINANCIAL_BELOW = "below"
@@ -92,7 +89,7 @@ class Market:
     # Calculated values
     fair_value: Optional[float] = None
     fair_value_time: Optional[datetime] = None  # When fair value was last computed
-    model_source: Optional[str] = None  # "futures", "sportsbook", etc.
+    model_source: Optional[str] = None
 
     # Full orderbook (optional)
     orderbook: Optional[Orderbook] = None
@@ -291,22 +288,6 @@ class Position:
         else:
             return self.current_ask  # Buy back NO at ask (or sell YES)
 
-
-@dataclass
-class Opportunity:
-    """Trading opportunity"""
-    market: Market
-    side: Side
-    edge: float
-    suggested_price: int  # Limit price in cents
-    suggested_size: int   # Number of contracts
-    confidence: str       # "HIGH", "MEDIUM", "LOW"
-    source: str          # "sports_arb", "financial_arb", "market_making"
-
-    @property
-    def expected_value(self) -> float:
-        """Expected value of trade"""
-        return self.edge * self.suggested_size
 
 
 @dataclass

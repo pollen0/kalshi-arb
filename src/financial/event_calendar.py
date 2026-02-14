@@ -254,21 +254,17 @@ def get_event_calendar() -> EventCalendar:
     return _calendar
 
 
-# FOMC dates for 2024-2025 (update as needed)
-# These are the major high-impact events to track
-FOMC_DATES_2024_2025 = [
-    # 2024
-    "2024-01-31", "2024-03-20", "2024-05-01", "2024-06-12",
-    "2024-07-31", "2024-09-18", "2024-11-07", "2024-12-18",
-    # 2025
-    "2025-01-29", "2025-03-19", "2025-05-07", "2025-06-18",
-    "2025-07-30", "2025-09-17", "2025-11-05", "2025-12-17",
+# FOMC dates (update annually)
+FOMC_DATES = [
+    # 2026
+    "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+    "2026-07-29", "2026-09-16", "2026-11-04", "2026-12-16",
 ]
 
 
 def load_fomc_dates(calendar: EventCalendar):
     """Load FOMC meeting dates into calendar"""
-    for date_str in FOMC_DATES_2024_2025:
+    for date_str in FOMC_DATES:
         try:
             # FOMC announcements are typically at 2:00 PM ET (19:00 UTC)
             event_time = datetime.strptime(date_str + " 19:00", "%Y-%m-%d %H:%M")

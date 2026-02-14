@@ -26,8 +26,7 @@ from src.core.client import KalshiClient
 from src.core.models import Position, Market, MarketType, Side
 from src.core.websocket_client import KalshiWebSocket, create_websocket_client
 from src.financial.futures import FuturesClient
-from src.financial.fair_value import calculate_range_probability, hours_until, DEFAULT_VOLATILITY
-from src.financial.fair_value_v2 import SophisticatedFairValue, calculate_range_probability_v2
+from src.financial.fair_value_v2 import SophisticatedFairValue, calculate_range_probability_v2, hours_until
 from src.financial.orderbook_analyzer import OrderbookAnalyzer, get_order_recommendation
 from src.financial.trading_strategy import TradingStrategy, generate_trading_plan, TradingPlan
 from src.financial.auto_trader import AutoTrader, TraderConfig, create_auto_trader
@@ -860,6 +859,95 @@ def create_app():
                                     m.fair_value = fv_result.probability
                                     m.fair_value_time = datetime.now(timezone.utc)
                                     m.model_source = f"ES={es.price:.0f} [{fv_result.vol_source}]"
+
+                    # Recalc above-type markets (same prices, upper_bound=inf)
+                    if nq and nq.price > 10000:
+                        for m in state["markets"].get("nasdaq_above", []):
+                            if m.lower_bound is not None:
+                                hours = hours_until(m.close_time)
+                                if hours and hours > 0:
+                                    ub = m.upper_bound if (m.upper_bound is not None and m.upper_bound != float('inf')) else float('inf')
+                                    fv_result = fv_model.calculate(
+                                        current_price=nq.price, lower_bound=m.lower_bound,
+                                        upper_bound=ub, hours_to_expiry=hours,
+                                        index="NDX", close_time=m.close_time,
+                                    )
+                                    m.fair_value = fv_result.probability
+                                    m.fair_value_time = datetime.now(timezone.utc)
+                                    m.model_source = f"NQ={nq.price:.0f} [{fv_result.vol_source}]"
+                    if es and es.price > 3000:
+                        for m in state["markets"].get("spx_above", []):
+                            if m.lower_bound is not None:
+                                hours = hours_until(m.close_time)
+                                if hours and hours > 0:
+                                    ub = m.upper_bound if (m.upper_bound is not None and m.upper_bound != float('inf')) else float('inf')
+                                    fv_result = fv_model.calculate(
+                                        current_price=es.price, lower_bound=m.lower_bound,
+                                        upper_bound=ub, hours_to_expiry=hours,
+                                        index="SPX", close_time=m.close_time,
+                                    )
+                                    m.fair_value = fv_result.probability
+                                    m.fair_value_time = datetime.now(timezone.utc)
+                                    m.model_source = f"ES={es.price:.0f} [{fv_result.vol_source}]"
+
+                    # Recalc crypto fair values (5s refresh instead of 30s)
+                    crypto_map = {
+                        "bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL",
+                        "dogecoin": "DOGE", "xrp": "XRP",
+                    }
+                    for coin_key, label in crypto_map.items():
+                        coin_quote = state["futures_quotes"].get(coin_key)
+                        if not coin_quote or not coin_quote.price:
+                            continue
+                        cp = coin_quote.price
+                        for m in state["markets"].get(coin_key, []):
+                            if m.lower_bound is None:
+                                continue
+                            hours = hours_until(m.close_time)
+                            if not hours or hours <= 0:
+                                continue
+                            ub = m.upper_bound if (m.upper_bound is not None and m.upper_bound != float('inf')) else float('inf')
+                            fv_result = fv_model.calculate(
+                                current_price=cp, lower_bound=m.lower_bound,
+                                upper_bound=ub, hours_to_expiry=hours,
+                                index=coin_key, close_time=m.close_time,
+                            )
+                            m.fair_value = fv_result.probability
+                            m.fair_value_time = datetime.now(timezone.utc)
+                            m.model_source = f"{label}=${cp:,.2f}"
+
+                    # Recalc treasury, forex fair values
+                    treasury_quote = state["futures_quotes"].get("treasury10y")
+                    if treasury_quote and treasury_quote.price:
+                        for m in state["markets"].get("treasury", []):
+                            if m.lower_bound is not None:
+                                hours = hours_until(m.close_time)
+                                if hours and hours > 0:
+                                    ub = m.upper_bound if (m.upper_bound is not None and m.upper_bound != float('inf')) else float('inf')
+                                    fv_result = fv_model.calculate(
+                                        current_price=treasury_quote.price, lower_bound=m.lower_bound,
+                                        upper_bound=ub, hours_to_expiry=hours,
+                                        index="treasury10y", close_time=m.close_time,
+                                    )
+                                    m.fair_value = fv_result.probability
+                                    m.fair_value_time = datetime.now(timezone.utc)
+
+                    for fx_key, fx_index in [("usdjpy", "USDJPY"), ("eurusd", "EURUSD")]:
+                        fx_quote = state["futures_quotes"].get(fx_key)
+                        if not fx_quote or not fx_quote.price:
+                            continue
+                        for m in state["markets"].get(fx_key, []):
+                            if m.lower_bound is not None:
+                                hours = hours_until(m.close_time)
+                                if hours and hours > 0:
+                                    ub = m.upper_bound if (m.upper_bound is not None and m.upper_bound != float('inf')) else float('inf')
+                                    fv_result = fv_model.calculate(
+                                        current_price=fx_quote.price, lower_bound=m.lower_bound,
+                                        upper_bound=ub, hours_to_expiry=hours,
+                                        index=fx_index, close_time=m.close_time,
+                                    )
+                                    m.fair_value = fv_result.probability
+                                    m.fair_value_time = datetime.now(timezone.utc)
             except Exception as e:
                 print(f"[FUTURES] Error: {e}")
             state["thread_heartbeats"]["fast_futures_updater"] = time.time()
@@ -3583,7 +3671,6 @@ DASHBOARD_HTML = '''
         }
 
         async function startAutoTrading() {
-            if (!confirm('Start auto-trading? This will automatically place limit orders.')) return;
             try {
                 await fetch('/api/auto-trader/start', {method: 'POST'});
                 loadAutoTraderStatus();
@@ -3602,7 +3689,6 @@ DASHBOARD_HTML = '''
         }
 
         async function cancelAllOrders() {
-            if (!confirm('Cancel all active orders?')) return;
             try {
                 const resp = await fetch('/api/auto-trader/cancel-all', {method: 'POST'});
                 const data = await resp.json();
@@ -3620,11 +3706,6 @@ DASHBOARD_HTML = '''
                 const status = await statusResp.json();
                 const currentDryRun = status.dry_run;
 
-                // If going from dry run to live, confirm
-                if (currentDryRun) {
-                    if (!confirm('Switch to LIVE MODE? Real orders will be placed!')) return;
-                }
-
                 const resp = await fetch('/api/auto-trader/dry-run', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
@@ -3639,7 +3720,6 @@ DASHBOARD_HTML = '''
         }
 
         async function resetHalt() {
-            if (!confirm('Reset safety halt? Make sure you understand why it halted.')) return;
             try {
                 const resp = await fetch('/api/auto-trader/reset-halt', {method: 'POST'});
                 const data = await resp.json();

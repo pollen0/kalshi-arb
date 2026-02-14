@@ -79,7 +79,8 @@ class TraderConfig:
     max_capital_pct: float = 0.8     # Use max 80% of balance for orders + positions
     price_buffer_cents: int = 1      # Place X cents below fair value
     rebalance_threshold: float = 0.005  # Rebalance if fair value moves 0.5%
-    min_volume: int = 0              # Minimum market volume to trade
+    min_volume: int = 0              # Minimum market volume to trade (0 = allow all, for MM mode)
+    min_volume_tight_spread: int = 10  # Minimum volume for tight-spread mode (must have activity)
     max_fair_value_extreme: float = 0.97  # Skip if fair value > 97% or < 3%
     min_price_cents: int = 3         # Don't place orders below 3c
     price_adjust_threshold: int = 2  # Adjust order if optimal price differs by 2c+
@@ -226,6 +227,12 @@ class AutoTrader:
         # Diagnostic logging timer
         self._last_diag_log: datetime = datetime.min.replace(tzinfo=timezone.utc)
 
+        # Closed markets cache — skip tickers that returned "market_closed" to avoid
+        # burning through the order failure budget on markets that are legitimately closed.
+        # Cleared every 10 minutes so reopened markets get retried.
+        self._closed_markets: set[str] = set()
+        self._closed_markets_cleared_at: float = time.time()
+
     def _load_daily_state(self):
         """Load persisted daily starting equity and peak equity (prevents loss-limit bypass on restart)."""
         try:
@@ -238,12 +245,12 @@ class AutoTrader:
                     self._starting_balance = data["starting_equity"]
                     self._starting_date = data["date"]
                     print(f"[SAFETY] Loaded persisted daily state: starting equity=${data['starting_equity']:.2f} from {today}")
+                    # Peak equity resets daily — drawdown is measured within the day
+                    if data.get("peak_equity"):
+                        self._peak_equity = data["peak_equity"]
+                        print(f"[SAFETY] Loaded peak equity: ${self._peak_equity:.2f}")
                 else:
                     print(f"[SAFETY] Persisted state is from {data.get('date')}, today is {today} — will reset")
-                # Peak equity persists across days (not reset daily)
-                if data.get("peak_equity"):
-                    self._peak_equity = data["peak_equity"]
-                    print(f"[SAFETY] Loaded peak equity: ${self._peak_equity:.2f}")
         except Exception as e:
             print(f"[SAFETY] Could not load daily state: {e}")
 
@@ -742,25 +749,21 @@ class AutoTrader:
 
         # Check for NaN or infinity
         if not (0 <= fv <= 1):
-            print(f"[SAFETY] Invalid fair value for {market.ticker}: {fv}")
             return False
 
-        # Check that fair value is somewhat reasonable given market prices
+        # Check that fair value is somewhat reasonable given market prices.
+        # Only apply in tight-spread markets where the mid is informative.
+        # In wide-spread / empty-book markets the "market mid" is meaningless
+        # (stale default or single-sided quote) — skip the deviation check
+        # and let the pricing logic handle it.
         if market.yes_bid and market.yes_ask:
-            market_mid = (market.yes_bid + market.yes_ask) / 200  # Convert to 0-1
-            diff = abs(fv - market_mid)
+            spread = market.yes_ask - market.yes_bid
+            if spread < self.config.market_making_min_spread:
+                market_mid = (market.yes_bid + market.yes_ask) / 200  # Convert to 0-1
+                diff = abs(fv - market_mid)
 
-            if diff > self.config.fv_deviation_reject_threshold:
-                print(f"[SAFETY] REJECTED fair value {fv:.2f} — deviation {diff:.2f} "
-                      f"from market mid {market_mid:.2f} exceeds reject threshold "
-                      f"{self.config.fv_deviation_reject_threshold:.2f} for {market.ticker}")
-                return False
-
-            if diff > self.config.fv_deviation_warn_threshold:
-                print(f"[SAFETY] WARNING: fair value {fv:.2f} deviates {diff:.2f} "
-                      f"from market mid {market_mid:.2f} (warn threshold "
-                      f"{self.config.fv_deviation_warn_threshold:.2f}) for {market.ticker}")
-                # Warn but allow
+                if diff > self.config.fv_deviation_reject_threshold:
+                    return False
 
         return True
 
@@ -778,7 +781,7 @@ class AutoTrader:
         if not market.close_time:
             return False
 
-        from .fair_value import hours_until
+        from .fair_value_v2 import hours_until
         hours = hours_until(market.close_time)
         if hours is None:
             return False
@@ -800,7 +803,7 @@ class AutoTrader:
         Returns:
             Tuple of (adjusted_min_edge, adjusted_position_size)
         """
-        from .fair_value import hours_until
+        from .fair_value_v2 import hours_until
         base_edge = self.config.min_edge
         base_size = self.config.position_size
 
@@ -945,6 +948,11 @@ class AutoTrader:
             spread >= self.config.market_making_min_spread
         )
 
+        # Orderbook depth from embedded orderbook (if available)
+        ob = market.orderbook
+        depth_yes_bids = sum(l.quantity for l in ob.yes_bids) if ob and ob.yes_bids else 0
+        depth_yes_asks = sum(l.quantity for l in ob.yes_asks) if ob and ob.yes_asks else 0
+
         if side == "yes":
             fair_cents = round(fair_yes * 100)
             current_bid = yes_bid
@@ -992,6 +1000,9 @@ class AutoTrader:
                 return None
 
             # TIGHT SPREAD MODE: Normal trading near fair value
+            # Require minimum volume in tight-spread mode
+            if (market.volume or 0) < self.config.min_volume_tight_spread:
+                return None
             # Skip extreme fair values
             if fair_yes < (1 - self.config.max_fair_value_extreme):
                 return None
@@ -1088,6 +1099,9 @@ class AutoTrader:
                 return None
 
             # TIGHT SPREAD MODE: Normal trading
+            # Require minimum volume in tight-spread mode
+            if (market.volume or 0) < self.config.min_volume_tight_spread:
+                return None
             if fair_no < (1 - self.config.max_fair_value_extreme):
                 return None
             if fair_no > self.config.max_fair_value_extreme:
@@ -1367,9 +1381,14 @@ class AutoTrader:
 
             if result.get("error"):
                 error_msg = result.get('message', 'Unknown error')
-                self.record_order_failure(market.ticker, error_msg)
-                print(f"[{timestamp}] ORDER FAILED: {side.upper()} {order_size}x @ {price}c on {market.ticker}")
-                print(f"    Error: {error_msg}")
+                # "market_closed" is non-fatal — just skip this market going forward
+                if "market_closed" in error_msg:
+                    self._closed_markets.add(market.ticker)
+                    print(f"[{timestamp}] Market closed, skipping: {market.ticker}")
+                else:
+                    self.record_order_failure(market.ticker, error_msg)
+                    print(f"[{timestamp}] ORDER FAILED: {side.upper()} {order_size}x @ {price}c on {market.ticker}")
+                    print(f"    Error: {error_msg}")
                 return None
 
             order_id = result.get("order", {}).get("order_id")
@@ -1905,7 +1924,11 @@ class AutoTrader:
         # SAFETY CHECK FIRST
         is_safe, reason = self.check_safety()
         if not is_safe:
-            print(f"[SAFETY] Trading halted: {reason}")
+            # Only log halt message once per minute to avoid log spam
+            now_ts = datetime.now(timezone.utc)
+            if not hasattr(self, '_last_halt_log') or (now_ts - self._last_halt_log).total_seconds() > 60:
+                print(f"[SAFETY] Trading halted: {reason}")
+                self._last_halt_log = now_ts
             self._loop_balance = None
             return  # Don't trade if safety check fails
 
@@ -1918,12 +1941,23 @@ class AutoTrader:
             # Sync with actual orders (pass markets for fill detection)
             self.sync_orders(markets)
 
+            # Periodically clear closed-markets cache (every 10 min) so reopened markets get retried
+            if time.time() - self._closed_markets_cleared_at > 600:
+                if self._closed_markets:
+                    print(f"[TRADER] Clearing {len(self._closed_markets)} closed-market entries for retry")
+                self._closed_markets.clear()
+                self._closed_markets_cleared_at = time.time()
+
             # Filter markets with valid fair values and not too close to expiry
             if self.config.sanity_check_prices:
                 markets = [m for m in markets if self.validate_fair_value(m)]
 
             # Filter out markets that are too close to expiry
             markets = [m for m in markets if not self.is_near_expiry(m, min_minutes=self.config.near_expiry_min_minutes)]
+
+            # Filter out markets known to be closed (avoids burning order-failure budget)
+            if self._closed_markets:
+                markets = [m for m in markets if m.ticker not in self._closed_markets]
 
             # Track order operations this loop (rate limiting)
             ops_this_loop = 0

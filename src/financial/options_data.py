@@ -78,24 +78,6 @@ class OptionsSnapshot:
     implied_probabilities: dict = field(default_factory=dict)  # strike -> probability
 
 
-@dataclass
-class ImpliedVolSurface:
-    """Implied volatility surface for an underlying"""
-    symbol: str
-    spot_price: float
-    timestamp: datetime
-
-    # ATM term structure (expiry -> IV)
-    atm_term_structure: dict = field(default_factory=dict)
-
-    # Skew by expiry (expiry -> skew)
-    skew_by_expiry: dict = field(default_factory=dict)
-
-    # Current 0DTE or nearest expiry data
-    nearest_expiry_iv: Optional[float] = None
-    nearest_expiry_skew: Optional[float] = None
-
-
 class OptionsDataClient:
     """
     Fetches and analyzes options data for implied volatility and probabilities.
