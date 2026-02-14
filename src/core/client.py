@@ -301,6 +301,10 @@ class KalshiClient:
                 if active:
                     print(f"[CLIENT] {series_prefix}: {len(active)} active markets via series_ticker")
                     return active
+                # Step1 found markets but none are active (e.g. off-hours).
+                # Don't fall through to expensive step2/step3 — the series exists,
+                # it just has no active markets right now.
+                return []
         except Exception as e:
             step1_result = f"error: {e}"
 
