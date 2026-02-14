@@ -15,8 +15,6 @@ import os
 # Add src to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from src.web.app import create_app
-
 
 def kill_existing(port: int):
     """Kill any process already listening on the given port."""
@@ -61,17 +59,14 @@ def main():
     ╚═══════════════════════════════════════════════════════╝
     """)
 
-    app = create_app()
-
     # Use gunicorn in production if available, fall back to Flask dev server
     try:
         import gunicorn  # noqa: F401
         from gunicorn.app.base import BaseApplication
 
         class StandaloneApplication(BaseApplication):
-            def __init__(self, app, options=None):
+            def __init__(self, options=None):
                 self.options = options or {}
-                self.application = app
                 super().__init__()
 
             def load_config(self):
@@ -80,19 +75,23 @@ def main():
                         self.cfg.set(key.lower(), value)
 
             def load(self):
-                return self.application
+                # create_app() runs HERE, inside the worker process (after fork).
+                # This ensures background threads start in the worker, not the master.
+                from src.web.app import create_app
+                return create_app()
 
         options = {
             'bind': f'0.0.0.0:{port}',
             'workers': 1,          # Single worker (background threads share state)
             'threads': 4,          # Handle concurrent dashboard requests
             'timeout': 120,        # Long timeout for slow API calls
-            'preload_app': False,   # Must be False: threads started in create_app() don't survive fork
         }
         print("[STARTUP] Using gunicorn production server")
-        StandaloneApplication(app, options).run()
+        StandaloneApplication(options).run()
     except ImportError:
         print("[STARTUP] gunicorn not installed, using Flask dev server (not for production)")
+        from src.web.app import create_app
+        app = create_app()
         app.run(host='0.0.0.0', port=port, debug=False)
 
 
