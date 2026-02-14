@@ -87,7 +87,7 @@ def main():
             'workers': 1,          # Single worker (background threads share state)
             'threads': 4,          # Handle concurrent dashboard requests
             'timeout': 120,        # Long timeout for slow API calls
-            'preload_app': True,
+            'preload_app': False,   # Must be False: threads started in create_app() don't survive fork
         }
         print("[STARTUP] Using gunicorn production server")
         StandaloneApplication(app, options).run()
