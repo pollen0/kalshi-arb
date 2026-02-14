@@ -708,14 +708,31 @@ def create_app():
             import traceback
             traceback.print_exc()
 
+    # Rotation counter for non-equity asset classes (spread API load)
+    _fast_market_rotation = {"counter": 0}
+
     def update_markets_fast():
         """Fast update of just market prices (not full refresh)"""
         if not state["client"]:
             return
 
         try:
-            # Get fresh quotes for all market types
-            for key in ["nasdaq_above", "nasdaq_range", "spx_above", "spx_range"]:
+            # Always refresh equity markets (highest priority, every 500ms)
+            equity_keys = ["nasdaq_above", "nasdaq_range", "spx_above", "spx_range"]
+
+            # Rotate through other asset classes (one group per iteration ≈ every 500ms)
+            # This keeps API calls manageable while refreshing non-equity markets every ~2.5s
+            other_groups = [
+                ["treasury", "wti"],
+                ["usdjpy", "eurusd"],
+                ["bitcoin", "ethereum"],
+                ["solana", "dogecoin", "xrp"],
+            ]
+            rotation = _fast_market_rotation["counter"] % len(other_groups)
+            _fast_market_rotation["counter"] += 1
+            current_keys = equity_keys + other_groups[rotation]
+
+            for key in current_keys:
                 markets = state["markets"].get(key, [])
                 if not markets:
                     continue

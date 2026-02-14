@@ -627,10 +627,12 @@ class FuturesClient:
                     continue
 
                 change_pct = values.get("usd_24h_change", 0) or 0
+                # Compute absolute change from percent: change = price * pct / (100 + pct)
+                abs_change = price * change_pct / (100 + change_pct) if change_pct != -100 else 0
                 quote = FuturesQuote(
                     symbol=cg_id.upper(),
                     price=price,
-                    change=0,  # CoinGecko doesn't give absolute change easily
+                    change=abs_change,
                     change_pct=change_pct,
                 )
                 quotes[key] = quote
@@ -713,11 +715,13 @@ class FuturesClient:
             if price <= 0:
                 return None
 
+            change_pct = values.get("usd_24h_change", 0) or 0
+            abs_change = price * change_pct / (100 + change_pct) if change_pct != -100 else 0
             quote = FuturesQuote(
                 symbol=cg_id.upper(),
                 price=price,
-                change=0,
-                change_pct=values.get("usd_24h_change", 0) or 0,
+                change=abs_change,
+                change_pct=change_pct,
             )
             self._set_cached(f"CRYPTO:{index}", quote)
             return quote

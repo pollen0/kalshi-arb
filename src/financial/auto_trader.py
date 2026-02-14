@@ -80,7 +80,7 @@ class TraderConfig:
     price_buffer_cents: int = 1      # Place X cents below fair value
     rebalance_threshold: float = 0.005  # Rebalance if fair value moves 0.5%
     min_volume: int = 0              # Minimum market volume to trade (0 = allow all, for MM mode)
-    min_volume_tight_spread: int = 10  # Minimum volume for tight-spread mode (must have activity)
+    min_volume_tight_spread: int = 0   # Minimum volume for tight-spread mode (0 = allow all)
     max_fair_value_extreme: float = 0.97  # Skip if fair value > 97% or < 3%
     min_price_cents: int = 3         # Don't place orders below 3c
     price_adjust_threshold: int = 2  # Adjust order if optimal price differs by 2c+
@@ -2079,7 +2079,25 @@ class AutoTrader:
                 print(f"[TRADER] Phase 3: {len(opportunities)} opps ({asset_classes}), "
                       f"skipped: {skipped_markets}, "
                       f"orders: {len(self.active_orders)}/{effective_max_orders}, "
-                      f"capital: ${available_capital:.0f}")
+                      f"capital: ${available_capital:.0f}, "
+                      f"closed_cache: {len(self._closed_markets)}")
+                # Log crypto market diagnostics (helps debug why orders aren't placing)
+                crypto_prefixes = ("KXBTC", "KXETH", "KXSOL", "KXDOGE", "KXXRP")
+                crypto_in_loop = [m for m in markets if m.ticker.startswith(crypto_prefixes)]
+                crypto_opps = [t for t in opportunities if t[0].ticker.startswith(crypto_prefixes)]
+                if crypto_in_loop or self._closed_markets:
+                    closed_crypto = [t for t in self._closed_markets if t.startswith(crypto_prefixes)]
+                    print(f"[TRADER] Crypto: {len(crypto_in_loop)} markets in loop, "
+                          f"{len(crypto_opps)} opps, {len(closed_crypto)} in closed-cache")
+                    # Sample first crypto market for detailed debug
+                    if crypto_in_loop:
+                        m = crypto_in_loop[0]
+                        spread = (m.yes_ask or 100) - (m.yes_bid or 0)
+                        fv_age = (now - m.fair_value_time).total_seconds() if m.fair_value_time else 999
+                        print(f"[TRADER] Crypto sample {m.ticker[-20:]}: "
+                              f"FV={m.fair_value:.1%} bid={m.yes_bid}c ask={m.yes_ask}c "
+                              f"spread={spread}c vol={m.volume} fv_age={fv_age:.0f}s")
+
                 # Log rejected markets that have significant displayed edge (helps debug)
                 for market in markets:
                     if market.fair_value and market.ticker not in self.market_orders:
