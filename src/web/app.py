@@ -705,7 +705,7 @@ def create_app():
 
             # Update Crypto markets (BTC, ETH, SOL, DOGE, XRP — each with 15min, hourly, daily)
             # Only keep markets expiring within MAX_CRYPTO_HOURS to avoid processing 8000+ markets
-            MAX_CRYPTO_HOURS = 8  # Only track markets expiring within 8 hours
+            MAX_CRYPTO_HOURS = 48  # Track up to 2 days (matches days_ahead=2)
             CRYPTO_COINS = {
                 "bitcoin": {"series": ["KXBTC", "KXBTC15M", "KXBTCD"], "label": "BTC"},
                 "ethereum": {"series": ["KXETH", "KXETH15M", "KXETHD"], "label": "ETH"},
