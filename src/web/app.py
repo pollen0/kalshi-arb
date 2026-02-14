@@ -897,6 +897,19 @@ def create_app():
 
         while True:
             try:
+                # Update balance and positions every 5s (instead of only every 30s)
+                if state["client"]:
+                    try:
+                        bal = state["client"].get_balance()
+                        new_positions = state["client"].get_positions()
+                        with state_lock:
+                            if bal is not None:
+                                state["balance"] = bal
+                            if new_positions is not None:
+                                state["positions"] = new_positions
+                    except Exception as e:
+                        print(f"[FUTURES] Balance update error: {e}")
+
                 # Update quotes - use settlement prices for fair value calculation
                 # get_all_settlement_prices handles overnight sessions by using
                 # futures-adjusted prices when cash markets are closed

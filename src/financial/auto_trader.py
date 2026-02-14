@@ -1471,6 +1471,23 @@ class AutoTrader:
             result = self.client.cancel_order(order_id)
 
             if result.get("error"):
+                # Check if order simply doesn't exist (already filled/expired/cancelled)
+                error_obj = result.get("error", {})
+                error_code = error_obj.get("code", "") if isinstance(error_obj, dict) else str(error_obj)
+                if "not_found" in error_code or "not_found" in str(result):
+                    # Order is gone from Kalshi — just clean up local tracking
+                    with self._lock:
+                        if order_id in self.active_orders:
+                            order = self.active_orders[order_id]
+                            del self.active_orders[order_id]
+                            if order.ticker in self.market_orders:
+                                del self.market_orders[order.ticker]
+                            if order.ticker in self.market_making_orders:
+                                self.market_making_orders[order.ticker].pop(order.side, None)
+                                if not self.market_making_orders[order.ticker]:
+                                    del self.market_making_orders[order.ticker]
+                            print(f"[TRADER] Order gone from Kalshi, removed from tracking: {order_id[:12]}... ({reason})")
+                    return True  # Goal achieved: order is no longer active
                 self.record_cancel_failure(order_id, result.get("message", "Unknown"))
                 return False
 
