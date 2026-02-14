@@ -97,6 +97,7 @@ class TraderConfig:
     market_making_edge_cents: int = 6       # Absolute cap: max 6c discount from FV
     market_making_max_fv: float = 0.92   # Allow market making up to 92% FV (on that side)
     market_making_min_fv: float = 0.03   # Allow market making down to 3% FV
+    market_making_min_volume: int = 5    # Min 24h volume to market-make (avoid adverse selection in dead books)
 
     # SAFETY LIMITS
     # max_daily_loss_pct is now sourced from RiskConfig (default 5%) for consistency.
@@ -481,12 +482,19 @@ class AutoTrader:
             self._halt("Total equity too low: ${:.2f}".format(equity))
             return False, self._halt_reason
 
-        # Check daily loss limit based on EQUITY (not just cash)
-        # This way, buying positions doesn't count as a "loss"
+        # Check daily loss limit based on COST-BASIS EQUITY (cash + position cost basis)
+        # Using MTM equity causes false halts because unrealized price swings
+        # in healthy positions trigger the loss limit. Cost-basis equity only
+        # changes on actual fills/settlements, so only real losses trigger halts.
+        cost_basis_equity = balance
+        with self._lock:
+            for pos in self.positions.values():
+                if pos.quantity > 0:
+                    cost_basis_equity += pos.quantity * pos.avg_price
         if self._starting_balance > 0:
-            daily_pnl_pct = (equity - self._starting_balance) / self._starting_balance
+            daily_pnl_pct = (cost_basis_equity - self._starting_balance) / self._starting_balance
             if daily_pnl_pct < -self.config.max_daily_loss_pct:
-                self._halt(f"Daily loss limit hit: {daily_pnl_pct*100:.1f}%")
+                self._halt(f"Daily loss limit hit: {daily_pnl_pct*100:.1f}% (cost-basis)")
                 return False, self._halt_reason
 
         # Check cumulative drawdown from peak equity
@@ -943,9 +951,12 @@ class AutoTrader:
         spread = yes_ask - yes_bid
 
         # Check if we should use market making mode (wide spread liquidity provision)
+        # Require minimum volume to avoid adverse selection in dead books
+        # (informed traders will pick off stale MM quotes in zero-volume markets)
         use_market_making = (
             self.config.market_making_enabled and
-            spread >= self.config.market_making_min_spread
+            spread >= self.config.market_making_min_spread and
+            (market.volume or 0) >= self.config.market_making_min_volume
         )
 
         # Orderbook depth from embedded orderbook (if available)
@@ -1346,7 +1357,9 @@ class AutoTrader:
                     print(f"[RISK] Blocked: {market.ticker[:30]} — {reason}")
                     return None
             except Exception as e:
-                print(f"[RISK] Risk check error (allowing order): {e}")
+                print(f"[RISK] Risk check error (BLOCKING order): {e}")
+                self.record_error(e, message=f"Risk check failed for {market.ticker}", ticker=market.ticker)
+                return None
 
             # DRY RUN MODE - log but don't execute
             if self.config.dry_run:
@@ -1617,21 +1630,37 @@ class AutoTrader:
                                             order.size, order.filled_count,
                                             order.fair_value_at_placement, order.is_exit))
 
-            # Lock released — now make API calls without blocking other threads
+            # Lock released — resolve disappeared orders using ONE batch fills call
+            # instead of N individual get_order_status calls (P1 fix).
+            if orders_to_check:
+                # Fetch recent fills in one API call — covers all disappeared orders
+                try:
+                    recent_fills = self.client.get_fills(limit=200)
+                except Exception:
+                    recent_fills = []
+
+                # Index fills by order_id for O(1) lookup
+                fills_by_order: dict[str, list[dict]] = {}
+                for fill in recent_fills:
+                    fill_oid = fill.get("order_id")
+                    if fill_oid:
+                        fills_by_order.setdefault(fill_oid, []).append(fill)
+
             for oid, ticker, side, price, size, prev_filled, fv_at_placement, was_exit in orders_to_check:
                 timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-                order_status = self.client.get_order_status(oid)
-                actual_status = order_status.get("status") if order_status else "unknown"
-                final_filled = order_status.get("filled_count", 0) if order_status else 0
-
                 market = self._markets_cache.get(ticker)
-                new_fills = final_filled - prev_filled
 
-                if actual_status in ("filled", "executed"):
+                # Determine fill count from batch fills data (no per-order API call)
+                order_fills = fills_by_order.get(oid, [])
+                final_filled = sum(f.get("count", 0) for f in order_fills) if order_fills else prev_filled
+                new_fills = max(0, final_filled - prev_filled)
+
+                # Infer status: if total filled == size, it was fully filled
+                # Otherwise, it was cancelled (possibly with partial fills)
+                if final_filled >= size:
+                    # Fully filled
                     if new_fills > 0:
                         self.tracker.record_partial_fill(oid, new_fills, size, market)
-                    # Exit fills tracked separately — don't trigger entry fill circuit breaker
                     if was_exit:
                         self._exit_fill_timestamps.append(time.time())
                     else:
@@ -1648,24 +1677,21 @@ class AutoTrader:
                     if fv_at_placement:
                         print(f"    FV at placement: {fv_at_placement:.1%}")
 
-                elif actual_status in ("canceled", "cancelled", "expired"):
-                    if final_filled > 0 and new_fills > 0:
-                        self.tracker.record_partial_fill(oid, new_fills, size, market)
-                        print(f"[{timestamp}] ORDER CANCELLED (with {final_filled} partial fills)")
+                elif final_filled > prev_filled:
+                    # Cancelled with partial fills
+                    self.tracker.record_partial_fill(oid, new_fills, size, market)
+                    if was_exit:
+                        self._exit_fill_timestamps.append(time.time())
                     else:
-                        self.tracker.record_cancel(oid, f"External {actual_status}")
-                        print(f"[{timestamp}] ORDER {actual_status.upper()}")
+                        self._fill_timestamps.append(time.time())
+                    print(f"[{timestamp}] ORDER CANCELLED (with {final_filled} partial fills)")
                     print(f"    ID: {oid}, Market: {ticker}")
-                    if final_filled > 0:
-                        print(f"    Partial fills: {final_filled}/{size} contracts")
+                    print(f"    Partial fills: {final_filled}/{size} contracts")
 
                 else:
-                    if final_filled > 0 and new_fills > 0:
-                        self.tracker.record_partial_fill(oid, new_fills, size, market)
-                        print(f"[{timestamp}] ORDER REMOVED (status: {actual_status}, {final_filled} filled)")
-                    else:
-                        self.tracker.record_cancel(oid, f"Unknown status: {actual_status}")
-                        print(f"[{timestamp}] ORDER REMOVED (status: {actual_status})")
+                    # Cancelled with no new fills
+                    self.tracker.record_cancel(oid, "Disappeared from resting")
+                    print(f"[{timestamp}] ORDER CANCELLED/EXPIRED")
                     print(f"    ID: {oid}, Market: {ticker}")
 
                 # Re-acquire lock briefly to update state

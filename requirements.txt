@@ -1,5 +1,6 @@
 # Web framework
 flask>=2.0.0
+gunicorn>=21.0.0
 
 # HTTP client
 requests>=2.25.0

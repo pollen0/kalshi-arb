@@ -103,6 +103,21 @@ def create_app():
         "trading_pause_reason": "",
     }
 
+    # All market category keys (single source of truth)
+    ALL_MARKET_KEYS = [
+        "nasdaq_above", "nasdaq_range", "spx_above", "spx_range",
+        "treasury", "usdjpy", "eurusd", "wti",
+        "bitcoin", "ethereum", "solana", "dogecoin", "xrp",
+    ]
+
+    def get_all_markets() -> list:
+        """Get all markets from all categories (snapshot under lock)."""
+        with state_lock:
+            result = []
+            for key in ALL_MARKET_KEYS:
+                result.extend(state["markets"].get(key, []))
+            return result
+
     # Orderbook analyzer
     analyzer = OrderbookAnalyzer(min_edge=0.02, max_position=50)
 
@@ -326,7 +341,8 @@ def create_app():
                                 range_markets.append(m)
                 except Exception as e:
                     print(f"[MARKETS] Error fetching KXNASDAQ100: {e}")
-                state["markets"]["nasdaq_range"] = sorted(range_markets, key=lambda x: x.lower_bound or 0)
+                with state_lock:
+                    state["markets"]["nasdaq_range"] = sorted(range_markets, key=lambda x: x.lower_bound or 0)
 
                 # Get NASDAQ-100 above/below markets from all active slots
                 above_markets = []
@@ -351,7 +367,8 @@ def create_app():
                                 above_markets.append(m)
                 except Exception as e:
                     print(f"[MARKETS] Error fetching KXNASDAQ100U: {e}")
-                state["markets"]["nasdaq_above"] = sorted(above_markets, key=lambda x: x.lower_bound or 0)
+                with state_lock:
+                    state["markets"]["nasdaq_above"] = sorted(above_markets, key=lambda x: x.lower_bound or 0)
 
             # Update S&P 500 markets from ALL expiration slots
             # KXINX = Range markets (between X and Y)
@@ -380,7 +397,8 @@ def create_app():
                                 range_markets.append(m)
                 except Exception as e:
                     print(f"[MARKETS] Error fetching KXINX: {e}")
-                state["markets"]["spx_range"] = sorted(range_markets, key=lambda x: x.lower_bound or 0)
+                with state_lock:
+                    state["markets"]["spx_range"] = sorted(range_markets, key=lambda x: x.lower_bound or 0)
 
                 # Get S&P 500 above/below markets from all active slots
                 above_markets = []
@@ -405,7 +423,8 @@ def create_app():
                                 above_markets.append(m)
                 except Exception as e:
                     print(f"[MARKETS] Error fetching KXINXU: {e}")
-                state["markets"]["spx_above"] = sorted(above_markets, key=lambda x: x.lower_bound or 0)
+                with state_lock:
+                    state["markets"]["spx_above"] = sorted(above_markets, key=lambda x: x.lower_bound or 0)
 
             # Update Treasury 10Y markets (KXTNOTED)
             try:
@@ -474,7 +493,8 @@ def create_app():
                             m.model_source = f"10Y={treasury_price:.3f}%"
                         treasury_markets.append(m)
 
-                state["markets"]["treasury"] = sorted(treasury_markets, key=lambda x: x.lower_bound or 0)
+                with state_lock:
+                    state["markets"]["treasury"] = sorted(treasury_markets, key=lambda x: x.lower_bound or 0)
                 if treasury_markets:
                     price_str = f", yield={treasury_price:.3f}%" if treasury_price else " (no quote)"
                     print(f"[MARKETS] Loaded {len(treasury_markets)} Treasury markets{price_str}")
@@ -485,15 +505,24 @@ def create_app():
 
             # Update USD/JPY markets (KXUSDJPY)
             try:
+                # Always fetch markets from Kalshi, regardless of quote availability
+                jpy_markets = state["client"].get_markets_by_series_prefix("KXUSDJPY", status="open")
+                usdjpy_markets = []
+
                 usdjpy_quote = state["futures_quotes"].get("usdjpy")
+                usdjpy_price = None
                 if usdjpy_quote and usdjpy_quote.price:
                     usdjpy_price = usdjpy_quote.price
+                else:
+                    fallback_quote = state["futures"].get_quote("usdjpy")
+                    if fallback_quote and fallback_quote.price:
+                        usdjpy_price = fallback_quote.price
+                        print(f"[MARKETS] USD/JPY quote from fallback: {usdjpy_price:.3f}")
 
-                    usdjpy_markets = []
-                    jpy_markets = state["client"].get_markets_by_series_prefix("KXUSDJPY", status="open")
-                    for m in (jpy_markets or []):
-                        hours = hours_until(m.close_time)
-                        if hours and hours > 0:
+                for m in (jpy_markets or []):
+                    hours = hours_until(m.close_time)
+                    if hours and hours > 0:
+                        if usdjpy_price:
                             if m.lower_bound is not None and m.upper_bound is not None:
                                 # Range market
                                 fv_result = fv_model.calculate(
@@ -504,28 +533,61 @@ def create_app():
                                     index="usdjpy",
                                     close_time=m.close_time,
                                 )
-                                m.fair_value = fv_result.probability
-                                m.fair_value_time = datetime.now(timezone.utc)
-                                m.model_source = f"USDJPY={usdjpy_price:.3f}"
-                                usdjpy_markets.append(m)
+                            elif m.lower_bound is not None:
+                                # Above market
+                                fv_result = fv_model.calculate(
+                                    current_price=usdjpy_price,
+                                    lower_bound=m.lower_bound,
+                                    upper_bound=float('inf'),
+                                    hours_to_expiry=hours,
+                                    index="usdjpy",
+                                    close_time=m.close_time,
+                                )
+                            elif m.upper_bound is not None:
+                                # Below market
+                                fv_result = fv_model.calculate(
+                                    current_price=usdjpy_price,
+                                    lower_bound=0,
+                                    upper_bound=m.upper_bound,
+                                    hours_to_expiry=hours,
+                                    index="usdjpy",
+                                    close_time=m.close_time,
+                                )
+                            else:
+                                continue
+                            m.fair_value = fv_result.probability
+                            m.fair_value_time = datetime.now(timezone.utc)
+                            m.model_source = f"USDJPY={usdjpy_price:.3f}"
+                        usdjpy_markets.append(m)
 
+                with state_lock:
                     state["markets"]["usdjpy"] = sorted(usdjpy_markets, key=lambda x: x.lower_bound or 0)
-                    if usdjpy_markets:
-                        print(f"[MARKETS] Loaded {len(usdjpy_markets)} USD/JPY markets, price={usdjpy_price:.3f}")
+                if usdjpy_markets:
+                    price_str = f", price={usdjpy_price:.3f}" if usdjpy_price else " (no quote)"
+                    print(f"[MARKETS] Loaded {len(usdjpy_markets)} USD/JPY markets{price_str}")
             except Exception as e:
                 print(f"[MARKETS] Error fetching USD/JPY: {e}")
 
             # Update EUR/USD markets (KXEURUSD)
             try:
+                # Always fetch markets from Kalshi, regardless of quote availability
+                eur_markets = state["client"].get_markets_by_series_prefix("KXEURUSD", status="open")
+                eurusd_markets = []
+
                 eurusd_quote = state["futures_quotes"].get("eurusd")
+                eurusd_price = None
                 if eurusd_quote and eurusd_quote.price:
                     eurusd_price = eurusd_quote.price
+                else:
+                    fallback_quote = state["futures"].get_quote("eurusd")
+                    if fallback_quote and fallback_quote.price:
+                        eurusd_price = fallback_quote.price
+                        print(f"[MARKETS] EUR/USD quote from fallback: {eurusd_price:.5f}")
 
-                    eurusd_markets = []
-                    eur_markets = state["client"].get_markets_by_series_prefix("KXEURUSD", status="open")
-                    for m in (eur_markets or []):
-                        hours = hours_until(m.close_time)
-                        if hours and hours > 0:
+                for m in (eur_markets or []):
+                    hours = hours_until(m.close_time)
+                    if hours and hours > 0:
+                        if eurusd_price:
                             if m.lower_bound is not None and m.upper_bound is not None:
                                 # Range market
                                 fv_result = fv_model.calculate(
@@ -536,14 +598,38 @@ def create_app():
                                     index="eurusd",
                                     close_time=m.close_time,
                                 )
-                                m.fair_value = fv_result.probability
-                                m.fair_value_time = datetime.now(timezone.utc)
-                                m.model_source = f"EURUSD={eurusd_price:.5f}"
-                                eurusd_markets.append(m)
+                            elif m.lower_bound is not None:
+                                # Above market
+                                fv_result = fv_model.calculate(
+                                    current_price=eurusd_price,
+                                    lower_bound=m.lower_bound,
+                                    upper_bound=float('inf'),
+                                    hours_to_expiry=hours,
+                                    index="eurusd",
+                                    close_time=m.close_time,
+                                )
+                            elif m.upper_bound is not None:
+                                # Below market
+                                fv_result = fv_model.calculate(
+                                    current_price=eurusd_price,
+                                    lower_bound=0,
+                                    upper_bound=m.upper_bound,
+                                    hours_to_expiry=hours,
+                                    index="eurusd",
+                                    close_time=m.close_time,
+                                )
+                            else:
+                                continue
+                            m.fair_value = fv_result.probability
+                            m.fair_value_time = datetime.now(timezone.utc)
+                            m.model_source = f"EURUSD={eurusd_price:.5f}"
+                        eurusd_markets.append(m)
 
+                with state_lock:
                     state["markets"]["eurusd"] = sorted(eurusd_markets, key=lambda x: x.lower_bound or 0)
-                    if eurusd_markets:
-                        print(f"[MARKETS] Loaded {len(eurusd_markets)} EUR/USD markets, price={eurusd_price:.5f}")
+                if eurusd_markets:
+                    price_str = f", price={eurusd_price:.5f}" if eurusd_price else " (no quote)"
+                    print(f"[MARKETS] Loaded {len(eurusd_markets)} EUR/USD markets{price_str}")
             except Exception as e:
                 print(f"[MARKETS] Error fetching EUR/USD: {e}")
 
@@ -564,8 +650,8 @@ def create_app():
                     for m in (raw or []):
                         hours = hours_until(m.close_time)
                         if hours and hours > 0:
-                            if wti_price and m.lower_bound is not None:
-                                if m.upper_bound is not None and m.upper_bound != float('inf'):
+                            if wti_price:
+                                if m.lower_bound is not None and m.upper_bound is not None:
                                     fv_result = fv_model.calculate(
                                         current_price=wti_price,
                                         lower_bound=m.lower_bound,
@@ -574,11 +660,20 @@ def create_app():
                                         index="wti",
                                         close_time=m.close_time,
                                     )
-                                elif m.upper_bound is None or m.upper_bound == float('inf'):
+                                elif m.lower_bound is not None:
                                     fv_result = fv_model.calculate(
                                         current_price=wti_price,
                                         lower_bound=m.lower_bound,
                                         upper_bound=float('inf'),
+                                        hours_to_expiry=hours,
+                                        index="wti",
+                                        close_time=m.close_time,
+                                    )
+                                elif m.upper_bound is not None:
+                                    fv_result = fv_model.calculate(
+                                        current_price=wti_price,
+                                        lower_bound=0,
+                                        upper_bound=m.upper_bound,
                                         hours_to_expiry=hours,
                                         index="wti",
                                         close_time=m.close_time,
@@ -590,7 +685,8 @@ def create_app():
                                 m.model_source = f"WTI=${wti_price:.2f}"
                             wti_markets.append(m)
 
-                state["markets"]["wti"] = sorted(wti_markets, key=lambda x: x.lower_bound or 0)
+                with state_lock:
+                    state["markets"]["wti"] = sorted(wti_markets, key=lambda x: x.lower_bound or 0)
                 if wti_markets:
                     price_str = f", price=${wti_price:.2f}" if wti_price else " (no quote)"
                     print(f"[MARKETS] Loaded {len(wti_markets)} WTI markets{price_str}")
@@ -621,8 +717,8 @@ def create_app():
                         for m in (raw or []):
                             hours = hours_until(m.close_time)
                             if hours and hours > 0:
-                                if coin_price and m.lower_bound is not None:
-                                    if m.upper_bound is not None and m.upper_bound != float('inf'):
+                                if coin_price:
+                                    if m.lower_bound is not None and m.upper_bound is not None:
                                         fv_result = fv_model.calculate(
                                             current_price=coin_price,
                                             lower_bound=m.lower_bound,
@@ -631,11 +727,20 @@ def create_app():
                                             index=coin_key,
                                             close_time=m.close_time,
                                         )
-                                    elif m.upper_bound is None or m.upper_bound == float('inf'):
+                                    elif m.lower_bound is not None:
                                         fv_result = fv_model.calculate(
                                             current_price=coin_price,
                                             lower_bound=m.lower_bound,
                                             upper_bound=float('inf'),
+                                            hours_to_expiry=hours,
+                                            index=coin_key,
+                                            close_time=m.close_time,
+                                        )
+                                    elif m.upper_bound is not None:
+                                        fv_result = fv_model.calculate(
+                                            current_price=coin_price,
+                                            lower_bound=0,
+                                            upper_bound=m.upper_bound,
                                             hours_to_expiry=hours,
                                             index=coin_key,
                                             close_time=m.close_time,
@@ -647,7 +752,8 @@ def create_app():
                                     m.model_source = f"{coin_info['label']}=${coin_price:,.2f}"
                                 coin_markets.append(m)
 
-                    state["markets"][coin_key] = sorted(coin_markets, key=lambda x: x.lower_bound or 0)
+                    with state_lock:
+                        state["markets"][coin_key] = sorted(coin_markets, key=lambda x: x.lower_bound or 0)
                     if coin_markets:
                         price_str = f", price=${coin_price:,.2f}" if coin_price else " (no quote)"
                         print(f"[MARKETS] Loaded {len(coin_markets)} {coin_info['label']} markets{price_str}")
@@ -765,14 +871,20 @@ def create_app():
     def background_updater():
         """Background thread for full data refresh (positions, new markets)"""
         while True:
-            update_data()
+            try:
+                update_data()
+            except Exception as e:
+                print(f"[THREAD] background_updater error: {e}")
             state["thread_heartbeats"]["background_updater"] = time.time()
             time.sleep(30)  # Full refresh every 30 seconds
 
     def fast_market_updater():
         """Fast background thread for market prices - every 500ms"""
         while True:
-            update_markets_fast()
+            try:
+                update_markets_fast()
+            except Exception as e:
+                print(f"[THREAD] fast_market_updater error: {e}")
             state["thread_heartbeats"]["fast_market_updater"] = time.time()
             time.sleep(0.5)  # Kalshi allows 20/sec, we use ~4/sec
 
@@ -918,14 +1030,15 @@ def create_app():
                             continue
                         cp = coin_quote.price
                         for m in state["markets"].get(coin_key, []):
-                            if m.lower_bound is None:
+                            if m.lower_bound is None and m.upper_bound is None:
                                 continue
                             hours = hours_until(m.close_time)
                             if not hours or hours <= 0:
                                 continue
+                            lb = m.lower_bound if m.lower_bound is not None else 0
                             ub = m.upper_bound if (m.upper_bound is not None and m.upper_bound != float('inf')) else float('inf')
                             fv_result = fv_model.calculate(
-                                current_price=cp, lower_bound=m.lower_bound,
+                                current_price=cp, lower_bound=lb,
                                 upper_bound=ub, hours_to_expiry=hours,
                                 index=coin_key, close_time=m.close_time,
                             )
@@ -933,38 +1046,31 @@ def create_app():
                             m.fair_value_time = datetime.now(timezone.utc)
                             m.model_source = f"{label}=${cp:,.2f}"
 
-                    # Recalc treasury, forex fair values
-                    treasury_quote = state["futures_quotes"].get("treasury10y")
-                    if treasury_quote and treasury_quote.price:
-                        for m in state["markets"].get("treasury", []):
-                            if m.lower_bound is not None:
-                                hours = hours_until(m.close_time)
-                                if hours and hours > 0:
-                                    ub = m.upper_bound if (m.upper_bound is not None and m.upper_bound != float('inf')) else float('inf')
-                                    fv_result = fv_model.calculate(
-                                        current_price=treasury_quote.price, lower_bound=m.lower_bound,
-                                        upper_bound=ub, hours_to_expiry=hours,
-                                        index="treasury10y", close_time=m.close_time,
-                                    )
-                                    m.fair_value = fv_result.probability
-                                    m.fair_value_time = datetime.now(timezone.utc)
-
-                    for fx_key, fx_index in [("usdjpy", "USDJPY"), ("eurusd", "EURUSD")]:
-                        fx_quote = state["futures_quotes"].get(fx_key)
-                        if not fx_quote or not fx_quote.price:
+                    # Recalc treasury, forex, WTI fair values
+                    for mkt_key, quote_key, index_name in [
+                        ("treasury", "treasury10y", "treasury10y"),
+                        ("usdjpy", "usdjpy", "usdjpy"),
+                        ("eurusd", "eurusd", "eurusd"),
+                        ("wti", "wti", "wti"),
+                    ]:
+                        q = state["futures_quotes"].get(quote_key)
+                        if not q or not q.price:
                             continue
-                        for m in state["markets"].get(fx_key, []):
-                            if m.lower_bound is not None:
-                                hours = hours_until(m.close_time)
-                                if hours and hours > 0:
-                                    ub = m.upper_bound if (m.upper_bound is not None and m.upper_bound != float('inf')) else float('inf')
-                                    fv_result = fv_model.calculate(
-                                        current_price=fx_quote.price, lower_bound=m.lower_bound,
-                                        upper_bound=ub, hours_to_expiry=hours,
-                                        index=fx_index, close_time=m.close_time,
-                                    )
-                                    m.fair_value = fv_result.probability
-                                    m.fair_value_time = datetime.now(timezone.utc)
+                        for m in state["markets"].get(mkt_key, []):
+                            if m.lower_bound is None and m.upper_bound is None:
+                                continue
+                            hours = hours_until(m.close_time)
+                            if not hours or hours <= 0:
+                                continue
+                            lb = m.lower_bound if m.lower_bound is not None else 0
+                            ub = m.upper_bound if (m.upper_bound is not None and m.upper_bound != float('inf')) else float('inf')
+                            fv_result = fv_model.calculate(
+                                current_price=q.price, lower_bound=lb,
+                                upper_bound=ub, hours_to_expiry=hours,
+                                index=index_name, close_time=m.close_time,
+                            )
+                            m.fair_value = fv_result.probability
+                            m.fair_value_time = datetime.now(timezone.utc)
             except Exception as e:
                 print(f"[FUTURES] Error: {e}")
             state["thread_heartbeats"]["fast_futures_updater"] = time.time()
@@ -975,21 +1081,7 @@ def create_app():
         while True:
             try:
                 if state["client"]:
-                    all_markets = (
-                        state["markets"].get("nasdaq_above", []) +
-                        state["markets"].get("nasdaq_range", []) +
-                        state["markets"].get("spx_above", []) +
-                        state["markets"].get("spx_range", []) +
-                        state["markets"].get("treasury", []) +
-                        state["markets"].get("usdjpy", []) +
-                        state["markets"].get("eurusd", []) +
-                        state["markets"].get("wti", []) +
-                        state["markets"].get("bitcoin", []) +
-                        state["markets"].get("ethereum", []) +
-                        state["markets"].get("solana", []) +
-                        state["markets"].get("dogecoin", []) +
-                        state["markets"].get("xrp", [])
-                    )
+                    all_markets = get_all_markets()
                     markets_with_edge = sorted(
                         [m for m in all_markets if m.best_edge and m.best_edge >= 0.02],
                         key=lambda x: x.best_edge or 0,
@@ -1015,21 +1107,7 @@ def create_app():
         strategy = TradingStrategy(min_edge=0.02, max_total_capital=500)
         while True:
             try:
-                all_markets = (
-                    state["markets"].get("nasdaq_above", []) +
-                    state["markets"].get("nasdaq_range", []) +
-                    state["markets"].get("spx_above", []) +
-                    state["markets"].get("spx_range", []) +
-                    state["markets"].get("treasury", []) +
-                    state["markets"].get("usdjpy", []) +
-                    state["markets"].get("eurusd", []) +
-                    state["markets"].get("wti", []) +
-                    state["markets"].get("bitcoin", []) +
-                    state["markets"].get("ethereum", []) +
-                    state["markets"].get("solana", []) +
-                    state["markets"].get("dogecoin", []) +
-                    state["markets"].get("xrp", [])
-                )
+                all_markets = get_all_markets()
                 if all_markets:
                     plan = strategy.generate_orders(all_markets)
                     with state_lock:
@@ -1065,52 +1143,46 @@ def create_app():
                             time.sleep(1)
                             continue
 
-                    all_markets = (
-                        state["markets"].get("nasdaq_above", []) +
-                        state["markets"].get("nasdaq_range", []) +
-                        state["markets"].get("spx_above", []) +
-                        state["markets"].get("spx_range", []) +
-                        state["markets"].get("treasury", []) +
-                        state["markets"].get("usdjpy", []) +
-                        state["markets"].get("eurusd", []) +
-                        state["markets"].get("wti", []) +
-                        state["markets"].get("bitcoin", []) +
-                        state["markets"].get("ethereum", []) +
-                        state["markets"].get("solana", []) +
-                        state["markets"].get("dogecoin", []) +
-                        state["markets"].get("xrp", [])
-                    )
+                    all_markets = get_all_markets()
                     # Only trade if we have fresh futures data (sanity check)
                     futures_ok = False
-                    nq = state["futures_quotes"].get("nasdaq")
-                    es = state["futures_quotes"].get("spx")
-                    t10y = state["futures_quotes"].get("treasury10y")
-                    usdjpy = state["futures_quotes"].get("usdjpy")
-                    eurusd = state["futures_quotes"].get("eurusd")
-                    wti = state["futures_quotes"].get("wti")
+                    with state_lock:
+                        nq = state["futures_quotes"].get("nasdaq")
+                        es = state["futures_quotes"].get("spx")
+                        t10y = state["futures_quotes"].get("treasury10y")
+                        usdjpy_q = state["futures_quotes"].get("usdjpy")
+                        eurusd_q = state["futures_quotes"].get("eurusd")
+                        wti_q = state["futures_quotes"].get("wti")
                     if nq and nq.price > 10000:  # NQ should be ~21000+
                         futures_ok = True
                     if es and es.price > 3000:   # ES should be ~6000+
                         futures_ok = True
                     if t10y and t10y.price > 0:  # Treasury yield should be positive
                         futures_ok = True
-                    if usdjpy and usdjpy.price > 100:  # USD/JPY should be ~150+
+                    if usdjpy_q and usdjpy_q.price > 100:  # USD/JPY should be ~150+
                         futures_ok = True
-                    if eurusd and eurusd.price > 0.5:  # EUR/USD should be ~1.0+
+                    if eurusd_q and eurusd_q.price > 0.5:  # EUR/USD should be ~1.0+
                         futures_ok = True
-                    if wti and wti.price > 20:  # WTI should be ~$60+
+                    if wti_q and wti_q.price > 20:  # WTI should be ~$60+
                         futures_ok = True
-                    btc = state["futures_quotes"].get("bitcoin")
+                    with state_lock:
+                        btc = state["futures_quotes"].get("bitcoin")
                     if btc and btc.price > 1000:  # BTC should be ~$90000+
                         futures_ok = True
 
                     # Check thread heartbeats — halt if critical threads are dead
-                    critical_threads = ["fast_futures_updater", "fast_market_updater"]
+                    # All data-producing threads are critical: if any dies, we trade on stale data
+                    critical_threads = {
+                        "fast_futures_updater": 30,    # Updates every 5s, stale after 30s
+                        "fast_market_updater": 15,     # Updates every 0.5s, stale after 15s
+                        "background_updater": 120,     # Updates every 30s, stale after 120s
+                        "orderbook_updater": 30,       # Updates every 1s, stale after 30s
+                    }
                     now_ts = time.time()
-                    for thread_name in critical_threads:
+                    for thread_name, max_age in critical_threads.items():
                         last_hb = state["thread_heartbeats"].get(thread_name)
-                        if last_hb and (now_ts - last_hb) > 60:
-                            print(f"[AUTO-TRADE] HALTING: {thread_name} heartbeat stale ({now_ts - last_hb:.0f}s)")
+                        if last_hb and (now_ts - last_hb) > max_age:
+                            print(f"[AUTO-TRADE] HALTING: {thread_name} heartbeat stale ({now_ts - last_hb:.0f}s > {max_age}s)")
                             state["auto_trader"]._halt(f"Thread {thread_name} dead (>{now_ts - last_hb:.0f}s)")
                             break
 
@@ -2016,7 +2088,7 @@ DASHBOARD_HTML = '''
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <title>Kalshi Arbitrage</title>
+    <title>Kalshi Trading</title>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
@@ -2040,2018 +2112,982 @@ DASHBOARD_HTML = '''
             --blue: #3b82f6;
             --purple: #a855f7;
             --orange: #f97316;
+            --yellow: #eab308;
         }
-
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-        }
-
+        * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
             font-family: 'Inter', -apple-system, sans-serif;
-            background: var(--bg-0);
-            color: var(--text-1);
-            line-height: 1.5;
-            -webkit-font-smoothing: antialiased;
-            min-height: 100vh;
+            background: var(--bg-0); color: var(--text-1);
+            line-height: 1.5; -webkit-font-smoothing: antialiased; min-height: 100vh;
         }
+        body.dry-run { border-top: 3px solid var(--orange); }
+        .app { max-width: 1400px; margin: 0 auto; padding: 16px 24px; }
 
-        /* Layout */
-        .app {
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 48px 24px;
+        /* Risk Bar */
+        .risk-bar {
+            display: flex; align-items: center; gap: 20px;
+            padding: 12px 20px; background: var(--bg-2);
+            border: 1px solid var(--border); border-radius: 12px; margin-bottom: 16px;
+            flex-wrap: wrap;
         }
+        body.dry-run .risk-bar { background: #1a1510; }
+        .rb-item { display: flex; flex-direction: column; gap: 2px; }
+        .rb-label {
+            font-size: 10px; font-weight: 600; color: var(--text-3);
+            text-transform: uppercase; letter-spacing: 0.5px;
+        }
+        .rb-value { font-size: 18px; font-weight: 600; color: var(--text-0); }
+        .rb-gauge { width: 120px; }
+        .gauge-track {
+            height: 6px; background: var(--bg-3); border-radius: 3px;
+            overflow: hidden; margin-top: 4px;
+        }
+        .gauge-fill {
+            height: 100%; border-radius: 3px;
+            transition: width 0.3s ease, background 0.3s ease;
+        }
+        .gauge-fill.ok { background: var(--green); }
+        .gauge-fill.warn { background: var(--yellow); }
+        .gauge-fill.danger { background: var(--red); }
 
-        /* Header */
-        .header {
-            margin-bottom: 48px;
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
+        .status-dot {
+            display: inline-block; width: 10px; height: 10px;
+            border-radius: 50%; margin-right: 6px;
         }
+        .status-dot.running { background: var(--green); animation: pulse 2s infinite; }
+        .status-dot.halted { background: var(--red); }
+        .status-dot.stopped { background: var(--text-3); }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.7} }
 
-        .header h1 {
-            font-size: 24px;
-            font-weight: 600;
-            color: var(--text-0);
-            margin-bottom: 4px;
+        .mode-badge {
+            padding: 4px 12px; border-radius: 4px;
+            font-size: 12px; font-weight: 700; letter-spacing: 0.5px;
         }
+        .mode-badge.live { background: var(--green); color: #000; }
+        .mode-badge.dry-run { background: var(--orange); color: #000; font-size: 14px; padding: 6px 16px; }
 
-        .header-sub {
-            font-size: 14px;
-            color: var(--text-3);
+        .kill-btn {
+            margin-left: auto; padding: 10px 24px;
+            font-size: 14px; font-weight: 700; color: white;
+            background: var(--red); border: none; border-radius: 8px;
+            cursor: pointer; text-transform: uppercase; letter-spacing: 1px;
         }
+        .kill-btn:hover { background: #dc2626; }
+
+        .error-count { cursor: pointer; padding: 2px 8px; border-radius: 4px; }
+        .error-count.has-errors { background: var(--red-dim); color: var(--red); }
+
+        .error-panel {
+            display: none; padding: 16px 20px; background: var(--bg-1);
+            border: 1px solid var(--border); border-radius: 12px; margin-bottom: 16px;
+        }
+        .error-panel.open { display: block; }
+        .error-bar-container {
+            display: flex; gap: 4px; height: 8px;
+            border-radius: 4px; overflow: hidden; margin-bottom: 12px;
+        }
+        .error-bar-segment { height: 100%; border-radius: 2px; }
+        .error-list { list-style: none; }
+        .error-list li {
+            padding: 6px 0; border-bottom: 1px solid var(--border);
+            font-size: 12px; color: var(--text-2); display: flex; gap: 8px; align-items: center;
+        }
+        .error-list li:last-child { border-bottom: none; }
+        .error-type-badge {
+            padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: 600;
+            background: var(--bg-3); color: var(--text-2); white-space: nowrap;
+        }
+        .error-threshold { font-size: 11px; color: var(--text-3); margin-top: 8px; }
 
         .data-age {
-            font-size: 11px;
-            font-weight: 600;
-            padding: 6px 12px;
-            border-radius: 100px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
+            font-size: 10px; font-weight: 600; padding: 4px 10px;
+            border-radius: 100px; text-transform: uppercase; letter-spacing: 0.5px;
         }
-
-        .data-age.live {
-            background: var(--green-dim);
-            color: var(--green);
-            animation: pulse 2s infinite;
-        }
-
-        .data-age.stale {
-            background: var(--red-dim);
-            color: var(--red);
-        }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.7; }
-        }
-
-        /* Stats Row */
-        .stats {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 16px;
-            margin-bottom: 48px;
-        }
-
-        .stat-card {
-            background: var(--bg-2);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 20px 24px;
-            transition: all 0.2s ease;
-        }
-
-        .stat-card:hover {
-            border-color: var(--border-light);
-        }
-
-        .stat-label {
-            font-size: 12px;
-            font-weight: 500;
-            color: var(--text-3);
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-bottom: 8px;
-        }
-
-        .stat-value {
-            font-size: 28px;
-            font-weight: 600;
-            color: var(--text-0);
-        }
-
-        .stat-value.positive { color: var(--green); }
-        .stat-value.negative { color: var(--red); }
-
-        .stat-change {
-            font-size: 13px;
-            color: var(--text-2);
-            margin-top: 4px;
-        }
+        .data-age.live { background: var(--green-dim); color: var(--green); animation: pulse 2s infinite; }
+        .data-age.stale { background: var(--red-dim); color: var(--red); }
 
         /* Tabs */
         .tabs {
-            display: flex;
-            gap: 8px;
-            margin-bottom: 32px;
-            border-bottom: 1px solid var(--border);
-            padding-bottom: 16px;
+            display: flex; gap: 8px; margin-bottom: 24px;
+            border-bottom: 1px solid var(--border); padding-bottom: 12px;
         }
-
         .tab {
-            padding: 10px 20px;
-            font-size: 14px;
-            font-weight: 500;
-            color: var(--text-2);
-            background: none;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            transition: all 0.15s ease;
+            padding: 10px 20px; font-size: 14px; font-weight: 500;
+            color: var(--text-2); background: none; border: none;
+            border-radius: 8px; cursor: pointer; transition: all 0.15s ease;
         }
+        .tab:hover { color: var(--text-1); background: var(--bg-3); }
+        .tab.active { color: var(--text-0); background: var(--bg-3); }
+        .section { display: none; }
+        .section.active { display: block; }
 
-        .tab:hover {
-            color: var(--text-1);
-            background: var(--bg-3);
-        }
-
-        .tab.active {
-            color: var(--text-0);
-            background: var(--bg-3);
-        }
-
-        /* Section */
-        .section {
-            display: none;
-        }
-
-        .section.active {
-            display: block;
-        }
-
-        .section-title {
-            font-size: 16px;
-            font-weight: 600;
-            color: var(--text-0);
-            margin-bottom: 20px;
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-
-        .section-title .badge {
-            font-size: 12px;
-            font-weight: 500;
-            padding: 4px 10px;
-            border-radius: 100px;
-            background: var(--bg-3);
-            color: var(--text-2);
-        }
-
-        /* Table */
+        /* Tables */
         .table-container {
-            background: var(--bg-1);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            overflow: hidden;
-            margin-bottom: 32px;
+            background: var(--bg-1); border: 1px solid var(--border);
+            border-radius: 12px; overflow: hidden; margin-bottom: 24px;
         }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-
+        table { width: 100%; border-collapse: collapse; }
         th {
-            text-align: left;
-            font-size: 11px;
-            font-weight: 600;
-            color: var(--text-3);
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            padding: 14px 20px;
-            background: var(--bg-2);
+            text-align: left; font-size: 11px; font-weight: 600; color: var(--text-3);
+            text-transform: uppercase; letter-spacing: 0.5px;
+            padding: 12px 16px; background: var(--bg-2);
             border-bottom: 1px solid var(--border);
         }
-
         td {
-            padding: 16px 20px;
-            font-size: 14px;
-            color: var(--text-1);
+            padding: 12px 16px; font-size: 13px; color: var(--text-1);
             border-bottom: 1px solid var(--border);
         }
-
-        tr:last-child td {
-            border-bottom: none;
-        }
-
-        tr:hover td {
-            background: var(--bg-hover);
-        }
-
-        .mono {
-            font-family: 'SF Mono', 'Fira Code', monospace;
-            font-size: 13px;
-        }
-
+        tr:last-child td { border-bottom: none; }
+        tr:hover td { background: var(--bg-hover); }
+        .mono { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 12px; }
         .text-green { color: var(--green); }
         .text-red { color: var(--red); }
         .text-blue { color: var(--blue); }
         .text-muted { color: var(--text-3); }
         .text-right { text-align: right; }
 
-        /* Price Comparison Bar */
-        .price-bar {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        .price-bar-track {
-            flex: 1;
-            height: 6px;
-            background: var(--bg-3);
-            border-radius: 3px;
-            position: relative;
-            overflow: hidden;
-        }
-
-        .price-bar-fill {
-            position: absolute;
-            top: 0;
-            left: 0;
-            height: 100%;
-            border-radius: 3px;
-            transition: width 0.3s ease;
-        }
-
-        .price-bar-fill.market { background: var(--blue); }
-        .price-bar-fill.model { background: var(--purple); opacity: 0.7; }
-
-        .price-bar-value {
-            font-size: 12px;
-            font-weight: 500;
-            min-width: 48px;
-            text-align: right;
-        }
-
-        /* Edge Indicator */
         .edge {
-            display: inline-flex;
-            align-items: center;
-            gap: 4px;
-            font-size: 12px;
-            font-weight: 600;
-            padding: 4px 8px;
-            border-radius: 4px;
+            display: inline-flex; align-items: center; gap: 4px;
+            font-size: 12px; font-weight: 600; padding: 3px 8px; border-radius: 4px;
+        }
+        .edge.positive { background: var(--green-dim); color: var(--green); }
+        tr.clickable { cursor: pointer; }
+        tr.clickable:hover td { background: var(--bg-3); }
+        .asset-badge {
+            font-size: 11px; font-weight: 600; padding: 2px 6px;
+            border-radius: 3px; background: var(--bg-3); color: var(--text-2);
         }
 
-        .edge.positive {
-            background: var(--green-dim);
-            color: var(--green);
+        /* Accordion */
+        .accordion-section { margin-bottom: 8px; }
+        .accordion-section summary {
+            cursor: pointer; padding: 12px 16px; background: var(--bg-2);
+            border: 1px solid var(--border); border-radius: 8px;
+            font-size: 14px; font-weight: 500; color: var(--text-1);
+            list-style: none; display: flex; align-items: center; gap: 12px;
         }
-
-        .edge.negative {
-            background: var(--red-dim);
-            color: var(--red);
+        .accordion-section summary::-webkit-details-marker { display: none; }
+        .accordion-section summary::before {
+            content: '\25B8'; font-size: 12px; color: var(--text-3); transition: transform 0.2s;
         }
-
-        /* Futures Badge */
-        .futures-badge {
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            padding: 8px 14px;
-            background: var(--bg-3);
-            border-radius: 8px;
-            margin-bottom: 20px;
+        .accordion-section[open] summary::before { transform: rotate(90deg); }
+        .accordion-section[open] summary { border-radius: 8px 8px 0 0; }
+        .accordion-content {
+            border: 1px solid var(--border); border-top: none;
+            border-radius: 0 0 8px 8px; overflow: hidden;
         }
-
-        .futures-badge .price {
-            font-size: 18px;
-            font-weight: 600;
-            color: var(--text-0);
+        .futures-inline {
+            display: inline-flex; align-items: center; gap: 6px;
+            padding: 2px 8px; background: var(--bg-3); border-radius: 4px; font-size: 12px;
         }
+        .futures-inline .fp { font-weight: 600; color: var(--text-0); }
+        .futures-inline .fc { font-size: 11px; font-weight: 500; }
 
-        .futures-badge .change {
-            font-size: 13px;
-            font-weight: 500;
-        }
-
-        /* Empty State */
-        .empty {
-            text-align: center;
-            padding: 60px 20px;
-            color: var(--text-3);
-        }
-
-        .empty-icon {
-            font-size: 48px;
-            margin-bottom: 16px;
-            opacity: 0.3;
-        }
-
-        /* Loading */
-        .loading {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 40px;
-            color: var(--text-3);
-        }
-
-        .spinner {
-            width: 20px;
-            height: 20px;
-            border: 2px solid var(--border);
-            border-top-color: var(--text-2);
-            border-radius: 50%;
-            animation: spin 0.8s linear infinite;
-            margin-right: 12px;
-        }
-
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-
-        /* Position Card */
+        /* Position Cards */
         .position-card {
-            background: var(--bg-2);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 20px;
-            margin-bottom: 16px;
+            background: var(--bg-2); border: 1px solid var(--border);
+            border-radius: 12px; padding: 16px 20px; margin-bottom: 12px;
         }
-
         .position-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            margin-bottom: 16px;
+            display: flex; justify-content: space-between;
+            align-items: flex-start; margin-bottom: 12px;
         }
-
-        .position-title {
-            font-size: 14px;
-            font-weight: 500;
-            color: var(--text-0);
-            margin-bottom: 4px;
-        }
-
-        .position-ticker {
-            font-size: 12px;
-            color: var(--text-3);
-            font-family: 'SF Mono', monospace;
-        }
-
+        .position-title { font-size: 13px; font-weight: 500; color: var(--text-0); margin-bottom: 2px; }
+        .position-ticker { font-size: 11px; color: var(--text-3); font-family: 'SF Mono', monospace; }
         .position-side {
-            font-size: 12px;
-            font-weight: 600;
-            padding: 4px 10px;
-            border-radius: 4px;
+            font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 4px;
         }
-
-        .position-side.yes {
-            background: var(--green-dim);
-            color: var(--green);
-        }
-
-        .position-side.no {
-            background: var(--red-dim);
-            color: var(--red);
-        }
-
-        .position-grid {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 16px;
-        }
-
-        .position-metric {
-            text-align: center;
-        }
-
+        .position-side.yes { background: var(--green-dim); color: var(--green); }
+        .position-side.no { background: var(--red-dim); color: var(--red); }
+        .position-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+        .position-metric { text-align: center; }
         .position-metric-label {
-            font-size: 11px;
-            color: var(--text-3);
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-bottom: 4px;
+            font-size: 10px; color: var(--text-3);
+            text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px;
         }
+        .position-metric-value { font-size: 15px; font-weight: 600; color: var(--text-0); }
 
-        .position-metric-value {
-            font-size: 16px;
-            font-weight: 600;
-            color: var(--text-0);
+        /* Order Age Colors */
+        .age-normal { color: var(--text-2); }
+        .age-stale { color: var(--orange); }
+        .age-critical { color: var(--red); }
+        .age-expired { color: var(--red); font-weight: 700; }
+
+        /* Controls */
+        .controls-bar {
+            display: flex; align-items: center; gap: 12px;
+            padding: 16px 20px; background: var(--bg-2);
+            border: 1px solid var(--border); border-radius: 12px; margin-bottom: 20px;
         }
-
-        /* Auto-Trader Panel */
-        .auto-trader-panel {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 20px 24px;
-            background: var(--bg-2);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            margin-bottom: 20px;
-        }
-
-        .auto-trader-status {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-
-        .status-indicator {
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            background: var(--red);
-        }
-
-        .status-indicator.running {
-            background: var(--green);
-            animation: pulse 2s infinite;
-        }
-
-        .auto-trader-stats {
-            display: flex;
-            gap: 32px;
-        }
-
-        .auto-trader-controls {
-            display: flex;
-            gap: 8px;
-        }
-
         .start-btn {
-            padding: 10px 20px;
-            font-size: 14px;
-            font-weight: 600;
-            color: var(--bg-0);
-            background: var(--green);
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
+            padding: 8px 20px; font-size: 13px; font-weight: 600;
+            color: var(--bg-0); background: var(--green);
+            border: none; border-radius: 6px; cursor: pointer;
         }
-
         .start-btn:hover { background: #16a34a; }
-
         .stop-btn {
-            padding: 10px 20px;
-            font-size: 14px;
-            font-weight: 600;
-            color: var(--text-0);
-            background: var(--red);
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
+            padding: 8px 20px; font-size: 13px; font-weight: 600;
+            color: var(--text-0); background: var(--red);
+            border: none; border-radius: 6px; cursor: pointer;
         }
-
         .cancel-btn {
-            padding: 10px 20px;
-            font-size: 14px;
-            font-weight: 500;
-            color: var(--text-1);
-            background: var(--bg-3);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            cursor: pointer;
+            padding: 8px 16px; font-size: 13px; font-weight: 500;
+            color: var(--text-1); background: var(--bg-3);
+            border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
         }
-
         .cancel-btn:hover { border-color: var(--red); color: var(--red); }
 
-        /* Config Panel */
+        /* Config */
         .config-panel {
-            padding: 20px 24px;
-            background: var(--bg-1);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            margin-bottom: 24px;
+            padding: 20px 24px; background: var(--bg-1);
+            border: 1px solid var(--border); border-radius: 12px; margin-bottom: 24px;
         }
-
         .config-panel h4 {
-            font-size: 12px;
-            font-weight: 600;
-            color: var(--text-3);
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-bottom: 16px;
+            font-size: 12px; font-weight: 600; color: var(--text-3);
+            text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 16px;
         }
-
         .config-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 16px;
-            margin-bottom: 16px;
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 16px; margin-bottom: 16px;
         }
-
-        .config-item {
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-        }
-
-        .config-item label {
-            font-size: 12px;
-            color: var(--text-3);
-        }
-
+        .config-item { display: flex; flex-direction: column; gap: 6px; }
+        .config-item label { font-size: 12px; color: var(--text-3); }
         .config-item input {
-            padding: 8px 12px;
-            font-size: 14px;
-            color: var(--text-0);
-            background: var(--bg-2);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            width: 80px;
+            padding: 8px 12px; font-size: 14px; color: var(--text-0);
+            background: var(--bg-2); border: 1px solid var(--border);
+            border-radius: 6px; width: 80px;
         }
-
-        .config-item input:focus {
-            outline: none;
-            border-color: var(--blue);
-        }
-
+        .config-item input:focus { outline: none; border-color: var(--blue); }
         .save-config-btn {
-            padding: 8px 16px;
-            font-size: 13px;
-            font-weight: 500;
-            color: var(--text-1);
-            background: var(--bg-3);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            cursor: pointer;
+            padding: 8px 16px; font-size: 13px; font-weight: 500;
+            color: var(--text-1); background: var(--bg-3);
+            border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
         }
-
         .save-config-btn:hover { background: var(--bg-hover); }
 
-        /* Trading Section */
-        .trading-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 24px;
-            padding: 20px;
-            background: var(--bg-2);
-            border: 1px solid var(--border);
-            border-radius: 12px;
+        /* Fill stats */
+        .fill-stats-panel {
+            padding: 16px; background: var(--bg-1);
+            border: 1px solid var(--border); border-radius: 12px; margin-bottom: 20px;
         }
-
-        .trading-stats {
-            display: flex;
-            gap: 32px;
+        .fill-stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+        .fill-stat { text-align: center; }
+        .fill-stat .label {
+            font-size: 10px; color: var(--text-3);
+            text-transform: uppercase; letter-spacing: 0.5px;
         }
-
-        .trading-stat {
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
-        }
-
-        .trading-stat .label {
-            font-size: 11px;
-            font-weight: 600;
-            color: var(--text-3);
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .trading-stat .value {
-            font-size: 20px;
-            font-weight: 600;
-            color: var(--text-0);
-        }
-
-        .place-all-btn {
-            padding: 12px 24px;
-            font-size: 14px;
-            font-weight: 600;
-            color: var(--bg-0);
-            background: var(--green);
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            transition: all 0.15s ease;
-        }
-
-        .place-all-btn:hover {
-            background: #16a34a;
-        }
-
-        .place-all-btn:disabled {
-            background: var(--text-3);
-            cursor: not-allowed;
-        }
-
-        .place-btn {
-            padding: 6px 12px;
-            font-size: 12px;
-            font-weight: 500;
-            color: var(--text-0);
-            background: var(--bg-3);
-            border: 1px solid var(--border);
-            border-radius: 4px;
-            cursor: pointer;
-        }
-
-        .place-btn:hover {
-            background: var(--green-dim);
-            border-color: var(--green);
-        }
-
-        /* Clickable rows */
-        tr.clickable {
-            cursor: pointer;
-        }
-
-        tr.clickable:hover td {
-            background: var(--bg-3);
-        }
+        .fill-stat .value { font-size: 18px; font-weight: 600; color: var(--text-0); }
 
         /* Modal */
         .modal-overlay {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0, 0, 0, 0.8);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            z-index: 1000;
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.8); display: flex;
+            align-items: center; justify-content: center; z-index: 1000;
         }
-
         .modal {
-            background: var(--bg-1);
-            border: 1px solid var(--border);
-            border-radius: 16px;
-            width: 90%;
-            max-width: 600px;
-            max-height: 80vh;
-            overflow: auto;
+            background: var(--bg-1); border: 1px solid var(--border);
+            border-radius: 16px; width: 90%; max-width: 600px;
+            max-height: 80vh; overflow: auto;
         }
-
         .modal-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 20px 24px;
-            border-bottom: 1px solid var(--border);
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 20px 24px; border-bottom: 1px solid var(--border);
         }
-
         .modal-header h3 {
-            font-size: 16px;
-            font-weight: 600;
-            color: var(--text-0);
+            font-size: 14px; font-weight: 600; color: var(--text-0);
             font-family: 'SF Mono', monospace;
         }
-
         .modal-close {
-            background: none;
-            border: none;
-            font-size: 24px;
-            color: var(--text-3);
-            cursor: pointer;
+            background: none; border: none; font-size: 24px;
+            color: var(--text-3); cursor: pointer;
         }
-
-        .modal-close:hover {
-            color: var(--text-1);
-        }
-
-        .modal-body {
-            padding: 24px;
-        }
-
-        .ob-section, .rec-section {
-            margin-bottom: 24px;
-        }
-
+        .modal-close:hover { color: var(--text-1); }
+        .modal-body { padding: 24px; }
+        .ob-section, .rec-section { margin-bottom: 24px; }
         .ob-section h4, .rec-section h4 {
-            font-size: 12px;
-            font-weight: 600;
-            color: var(--text-3);
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-bottom: 12px;
+            font-size: 12px; font-weight: 600; color: var(--text-3);
+            text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 12px;
         }
-
-        .ob-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 16px;
-        }
-
-        .ob-header {
-            font-size: 11px;
-            font-weight: 600;
-            color: var(--text-3);
-            margin-bottom: 8px;
-        }
-
+        .ob-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+        .ob-header { font-size: 11px; font-weight: 600; color: var(--text-3); margin-bottom: 8px; }
         .ob-level {
-            display: flex;
-            justify-content: space-between;
-            padding: 6px 10px;
-            font-family: 'SF Mono', monospace;
-            font-size: 13px;
-            border-radius: 4px;
-            margin-bottom: 4px;
+            display: flex; justify-content: space-between;
+            padding: 6px 10px; font-family: 'SF Mono', monospace;
+            font-size: 13px; border-radius: 4px; margin-bottom: 4px;
         }
-
-        .ob-level.bid {
-            background: var(--green-dim);
-            color: var(--green);
-        }
-
-        .ob-level.ask {
-            background: var(--red-dim);
-            color: var(--red);
-        }
-
-        .ob-level .qty {
-            color: var(--text-3);
-        }
-
-        .ob-stats {
-            margin-top: 12px;
-            font-size: 13px;
-            color: var(--text-2);
-        }
-
+        .ob-level.bid { background: var(--green-dim); color: var(--green); }
+        .ob-level.ask { background: var(--red-dim); color: var(--red); }
+        .ob-level .qty { color: var(--text-3); }
+        .ob-stats { margin-top: 12px; font-size: 13px; color: var(--text-2); }
         .rec-card {
-            background: var(--bg-2);
-            border: 1px solid var(--green-dim);
-            border-radius: 8px;
-            padding: 16px;
+            background: var(--bg-2); border: 1px solid var(--green-dim);
+            border-radius: 8px; padding: 16px;
         }
+        .rec-action { font-size: 18px; font-weight: 600; color: var(--green); margin-bottom: 8px; }
+        .rec-stats { font-size: 13px; color: var(--text-2); margin-bottom: 8px; }
+        .rec-reasoning { font-size: 12px; color: var(--text-3); }
 
-        .rec-action {
-            font-size: 18px;
-            font-weight: 600;
-            color: var(--green);
-            margin-bottom: 8px;
+        .empty { text-align: center; padding: 48px 20px; color: var(--text-3); }
+        .loading {
+            display: flex; align-items: center; justify-content: center;
+            padding: 32px; color: var(--text-3);
         }
-
-        .rec-stats {
-            font-size: 13px;
-            color: var(--text-2);
-            margin-bottom: 8px;
+        .spinner {
+            width: 18px; height: 18px; border: 2px solid var(--border);
+            border-top-color: var(--text-2); border-radius: 50%;
+            animation: spin 0.8s linear infinite; margin-right: 10px;
         }
+        @keyframes spin { to { transform: rotate(360deg); } }
 
-        .rec-reasoning {
-            font-size: 12px;
-            color: var(--text-3);
-        }
-
-        /* Responsive */
         @media (max-width: 768px) {
-            .app { padding: 24px 16px; }
-            .stats { grid-template-columns: 1fr 1fr; }
+            .app { padding: 12px; }
+            .risk-bar { gap: 12px; padding: 10px 14px; }
+            .rb-value { font-size: 14px; }
             .position-grid { grid-template-columns: repeat(2, 1fr); }
-            th, td { padding: 12px 16px; }
         }
     </style>
 </head>
 <body>
     <div class="app">
-        <!-- Header -->
-        <header class="header">
-            <div>
-                <h1>Kalshi Arbitrage</h1>
-                <p class="header-sub">Financial markets vs futures pricing</p>
+        <!-- Risk Bar -->
+        <div class="risk-bar" id="risk-bar">
+            <div class="rb-item">
+                <span class="rb-label">Balance</span>
+                <span class="rb-value" id="rb-balance">$0</span>
             </div>
-            <div class="data-age live" id="data-age">LIVE</div>
-        </header>
+            <div class="rb-item rb-gauge">
+                <span class="rb-label">Daily P&amp;L</span>
+                <span class="rb-value" id="rb-daily-pnl" style="font-size:14px;">$0</span>
+                <div class="gauge-track"><div class="gauge-fill ok" id="rb-pnl-gauge" style="width:0%"></div></div>
+            </div>
+            <div class="rb-item rb-gauge">
+                <span class="rb-label">Exposure</span>
+                <span class="rb-value" id="rb-exposure" style="font-size:14px;">0%</span>
+                <div class="gauge-track"><div class="gauge-fill ok" id="rb-exposure-gauge" style="width:0%"></div></div>
+            </div>
+            <div class="rb-item">
+                <span class="rb-label">Status</span>
+                <span id="rb-status" style="font-size:13px;font-weight:500;">
+                    <span class="status-dot stopped"></span> Stopped
+                </span>
+            </div>
+            <div class="rb-item">
+                <span class="rb-label">Errors</span>
+                <span class="error-count" id="rb-error-count" onclick="toggleErrorPanel()">0</span>
+            </div>
+            <span class="mode-badge live" id="rb-mode">LIVE</span>
+            <span class="data-age live" id="data-age">LIVE</span>
+            <button class="kill-btn" onclick="killSwitch()">KILL</button>
+        </div>
 
-        <!-- Stats -->
-        <div class="stats">
-            <div class="stat-card">
-                <div class="stat-label">Account Balance</div>
-                <div class="stat-value" id="balance">$0.00</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Open Positions</div>
-                <div class="stat-value" id="position-count">0</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Unrealized P&L</div>
-                <div class="stat-value" id="unrealized-pnl">$0.00</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Best Edge</div>
-                <div class="stat-value" id="best-edge">-</div>
-            </div>
+        <!-- Error Panel -->
+        <div class="error-panel" id="error-panel">
+            <div style="font-size:12px;font-weight:600;color:var(--text-2);margin-bottom:8px;">Error Breakdown</div>
+            <div class="error-bar-container" id="error-bar"></div>
+            <div class="error-threshold" id="error-thresholds"></div>
+            <div style="margin-top:12px;font-size:12px;font-weight:600;color:var(--text-2);margin-bottom:6px;">Recent Errors</div>
+            <ul class="error-list" id="error-list"></ul>
         </div>
 
         <!-- Tabs -->
         <div class="tabs">
-            <button class="tab active" data-tab="positions">Positions</button>
-            <button class="tab" data-tab="trading">Trading Plan</button>
-            <button class="tab" data-tab="nasdaq-above">NDX Above</button>
-            <button class="tab" data-tab="nasdaq-range">NDX Range</button>
-            <button class="tab" data-tab="spx-above">SPX Above</button>
-            <button class="tab" data-tab="spx-range">SPX Range</button>
-            <button class="tab" data-tab="treasury">10Y Treasury</button>
-            <button class="tab" data-tab="usdjpy">USD/JPY</button>
-            <button class="tab" data-tab="eurusd">EUR/USD</button>
-            <button class="tab" data-tab="wti">WTI Oil</button>
-            <button class="tab" data-tab="bitcoin">BTC</button>
-            <button class="tab" data-tab="ethereum">ETH</button>
-            <button class="tab" data-tab="solana">SOL</button>
-            <button class="tab" data-tab="dogecoin">DOGE</button>
-            <button class="tab" data-tab="xrp">XRP</button>
+            <button class="tab active" data-tab="opportunities">Opportunities</button>
+            <button class="tab" data-tab="positions">Positions &amp; Orders</button>
+            <button class="tab" data-tab="settings">Settings</button>
         </div>
 
-        <!-- Positions Section -->
-        <section class="section active" id="section-positions">
-            <div id="positions-container">
-                <div class="loading">
-                    <div class="spinner"></div>
-                    Loading positions...
-                </div>
-            </div>
-        </section>
-
-        <!-- Trading Plan Section -->
-        <section class="section" id="section-trading">
-            <div class="section-title" style="margin-bottom: 12px;">Auto-Trader</div>
-            <!-- Auto-Trader Controls -->
-            <div class="auto-trader-panel">
-                <div class="auto-trader-status">
-                    <div class="status-indicator" id="trader-status-light"></div>
-                    <span id="trader-status-text">Stopped</span>
-                    <span id="trader-mode-badge" style="margin-left: 12px; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600;">LIVE</span>
-                </div>
-                <div class="auto-trader-stats">
-                    <div class="trading-stat">
-                        <span class="label">Active Orders</span>
-                        <span class="value" id="active-order-count">0</span>
-                    </div>
-                    <div class="trading-stat">
-                        <span class="label">Positions</span>
-                        <span class="value" id="total-positions">0</span>
-                    </div>
-                    <div class="trading-stat">
-                        <span class="label">Exposure</span>
-                        <span class="value" id="total-exposure">$0</span>
-                    </div>
-                    <div class="trading-stat">
-                        <span class="label">Balance</span>
-                        <span class="value" id="trader-balance">$0</span>
-                    </div>
-                    <div class="trading-stat">
-                        <span class="label">Daily P&L</span>
-                        <span class="value" id="daily-pnl">$0</span>
-                    </div>
-                    <div class="trading-stat">
-                        <span class="label">Errors</span>
-                        <span class="value" id="error-count">0</span>
-                    </div>
-                </div>
-                <div class="auto-trader-controls">
-                    <button class="start-btn" id="start-trading-btn" onclick="startAutoTrading()">Start Trading</button>
-                    <button class="stop-btn" id="stop-trading-btn" onclick="stopAutoTrading()" style="display:none">Stop</button>
-                    <button class="cancel-btn" onclick="cancelAllOrders()">Cancel All</button>
-                    <button id="dry-run-toggle" onclick="toggleDryRun()" style="margin-left: 8px; padding: 8px 12px; border-radius: 4px; border: none; cursor: pointer;">DRY RUN</button>
-                    <button id="reset-halt-btn" onclick="resetHalt()" style="display:none; margin-left: 8px; padding: 8px 12px; border-radius: 4px; border: none; cursor: pointer; background: var(--red); color: white;">Reset Halt</button>
-                </div>
-            </div>
-
-            <!-- Fill Probability Stats -->
-            <div class="fill-stats-panel" style="margin-top: 16px; padding: 16px; background: var(--bg-1); border-radius: 8px;">
-                <h4 style="margin: 0 0 12px 0; font-size: 14px; color: var(--text-2);">Learned Fill Probabilities</h4>
-                <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;">
-                    <div class="trading-stat">
-                        <span class="label">Total Orders</span>
-                        <span class="value" id="fill-total">0</span>
-                    </div>
-                    <div class="trading-stat">
-                        <span class="label">Fill Rate</span>
-                        <span class="value" id="fill-rate">--</span>
-                    </div>
-                    <div class="trading-stat">
-                        <span class="label">Avg Fill Time</span>
-                        <span class="value" id="fill-time">--</span>
-                    </div>
-                    <div class="trading-stat">
-                        <span class="label">Adverse Selection</span>
-                        <span class="value" id="adverse-selection">--</span>
-                    </div>
-                </div>
-                <div id="fill-rates-by-spread" style="margin-top: 12px; font-size: 12px; color: var(--text-2);"></div>
-            </div>
-
-            <!-- Unified Trading Config Panel -->
-            <div class="config-panel">
-                <h4>Trading Config</h4>
-                <div style="font-size: 11px; color: var(--text-3); margin-bottom: 12px;">Risk management</div>
-                <div class="config-grid">
-                    <div class="config-item">
-                        <label>Daily Loss Limit</label>
-                        <input type="number" id="cfg-daily-loss" value="5" step="0.5" min="1" max="20"> %
-                    </div>
-                    <div class="config-item">
-                        <label>Max Drawdown</label>
-                        <input type="number" id="cfg-max-drawdown" value="15" step="1" min="5" max="50"> %
-                    </div>
-                    <div class="config-item">
-                        <label>Max Exposure</label>
-                        <input type="number" id="cfg-max-exposure" value="80" step="5" min="10" max="100"> %
-                    </div>
-                </div>
-                <div style="font-size: 11px; color: var(--text-3); margin: 12px 0 8px;">Strategy-specific</div>
-                <div class="config-grid">
-                    <div class="config-item">
-                        <label>Fin Min Edge</label>
-                        <input type="number" id="cfg-fin-min-edge" value="2" step="0.5" min="0.5" max="20"> %
-                    </div>
-                    <div class="config-item">
-                        <label>Fin Position Size</label>
-                        <input type="number" id="cfg-fin-position-size" value="10" step="5" min="1" max="100">
-                    </div>
-                    <div class="config-item">
-                        <label>Max Orders</label>
-                        <input type="number" id="cfg-max-orders" value="20" step="5" min="5" max="200">
-                    </div>
-                </div>
-                <button class="save-config-btn" onclick="saveConfig()">Save Config</button>
-            </div>
-
-            <!-- Active Orders Table -->
-            <h4 style="margin: 24px 0 16px; color: var(--text-2)">Active Orders</h4>
+        <!-- OPPORTUNITIES TAB -->
+        <section class="section active" id="section-opportunities">
             <div class="table-container">
                 <table>
-                    <thead>
-                        <tr>
-                            <th>Market</th>
-                            <th>Side</th>
-                            <th class="text-right">Price</th>
-                            <th class="text-right">Size</th>
-                            <th class="text-right">Fair Value</th>
-                            <th class="text-right">Age</th>
-                        </tr>
-                    </thead>
+                    <thead><tr>
+                        <th>Asset</th><th>Strike / Range</th><th>Expiry</th>
+                        <th class="text-right">Market</th><th class="text-right">Model</th>
+                        <th class="text-right">Edge</th><th class="text-right">Action</th>
+                        <th class="text-right">Vol</th>
+                    </tr></thead>
+                    <tbody id="opportunities-table">
+                        <tr><td colspan="8" class="loading"><div class="spinner"></div> Loading...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div style="font-size:14px;font-weight:600;color:var(--text-2);margin-bottom:12px;">All Markets by Asset</div>
+            <div id="asset-accordions"></div>
+        </section>
+
+        <!-- POSITIONS & ORDERS TAB -->
+        <section class="section" id="section-positions">
+            <div class="controls-bar">
+                <button class="start-btn" id="start-trading-btn" onclick="startAutoTrading()">Start Trading</button>
+                <button class="stop-btn" id="stop-trading-btn" onclick="stopAutoTrading()" style="display:none">Stop</button>
+                <button class="cancel-btn" onclick="cancelAllOrders()">Cancel All</button>
+                <button id="dry-run-toggle" onclick="toggleDryRun()" style="padding:8px 12px;border-radius:6px;border:none;cursor:pointer;font-size:13px;font-weight:500;">DRY RUN</button>
+                <button id="reset-halt-btn" onclick="resetHalt()" style="display:none;padding:8px 12px;border-radius:6px;border:none;cursor:pointer;background:var(--red);color:white;font-size:13px;">Reset Halt</button>
+            </div>
+            <div style="font-size:14px;font-weight:600;color:var(--text-2);margin-bottom:12px;">Open Positions</div>
+            <div id="positions-container"><div class="empty"><p>No open positions</p></div></div>
+
+            <div style="font-size:14px;font-weight:600;color:var(--text-2);margin:20px 0 12px;">Active Orders</div>
+            <div class="table-container">
+                <table>
+                    <thead><tr>
+                        <th>Market</th><th>Side</th>
+                        <th class="text-right">Price</th><th class="text-right">Size</th>
+                        <th class="text-right">Fair Value</th><th class="text-right">Age</th>
+                    </tr></thead>
                     <tbody id="active-orders-table">
                         <tr><td colspan="6" class="text-muted" style="text-align:center">No active orders</td></tr>
                     </tbody>
                 </table>
             </div>
 
-        </section>
-
-        <!-- NASDAQ Above Section -->
-        <section class="section" id="section-nasdaq-above">
-            <div class="futures-badge">
-                <span style="color: var(--text-3)">NDX Index (^NDX):</span>
-                <span class="price" id="nq-price-1">-</span>
-                <span class="change" id="nq-change-1">-</span>
-            </div>
-
-            <div class="table-container">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Strike</th>
-                            <th class="text-right">Market (YES)</th>
-                            <th class="text-right">Model (YES)</th>
-                            <th class="text-right">Best Trade</th>
-                            <th class="text-right">Action</th>
-                        </tr>
-                    </thead>
-                    <tbody id="nasdaq-above-table">
-                        <tr><td colspan="5" class="loading"><div class="spinner"></div> Loading...</td></tr>
-                    </tbody>
-                </table>
+            <div style="font-size:14px;font-weight:600;color:var(--text-2);margin:20px 0 12px;">Fill Statistics</div>
+            <div class="fill-stats-panel">
+                <div class="fill-stats-grid">
+                    <div class="fill-stat"><div class="label">Total Orders</div><div class="value" id="fill-total">0</div></div>
+                    <div class="fill-stat"><div class="label">Fill Rate</div><div class="value" id="fill-rate">--</div></div>
+                    <div class="fill-stat"><div class="label">Avg Fill Time</div><div class="value" id="fill-time">--</div></div>
+                    <div class="fill-stat"><div class="label">Adverse Selection</div><div class="value" id="adverse-selection">--</div></div>
+                </div>
+                <div id="fill-rates-by-spread" style="margin-top:12px;font-size:12px;color:var(--text-2);"></div>
             </div>
         </section>
 
-        <!-- NASDAQ Range Section -->
-        <section class="section" id="section-nasdaq-range">
-            <div class="futures-badge">
-                <span style="color: var(--text-3)">NDX Index (^NDX):</span>
-                <span class="price" id="nq-price-2">-</span>
-                <span class="change" id="nq-change-2">-</span>
-            </div>
-
-            <div class="table-container">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Range</th>
-                            <th class="text-right">Market (YES)</th>
-                            <th class="text-right">Model (YES)</th>
-                            <th class="text-right">Best Trade</th>
-                            <th class="text-right">Action</th>
-                        </tr>
-                    </thead>
-                    <tbody id="nasdaq-range-table">
-                        <tr><td colspan="5" class="loading"><div class="spinner"></div> Loading...</td></tr>
-                    </tbody>
-                </table>
+        <!-- SETTINGS TAB -->
+        <section class="section" id="section-settings">
+            <div class="config-panel">
+                <h4>Trading Config</h4>
+                <div style="font-size:11px;color:var(--text-3);margin-bottom:12px;">Risk management</div>
+                <div class="config-grid">
+                    <div class="config-item"><label>Daily Loss Limit</label><input type="number" id="cfg-daily-loss" value="5" step="0.5" min="1" max="20"> %</div>
+                    <div class="config-item"><label>Max Drawdown</label><input type="number" id="cfg-max-drawdown" value="15" step="1" min="5" max="50"> %</div>
+                    <div class="config-item"><label>Max Exposure</label><input type="number" id="cfg-max-exposure" value="80" step="5" min="10" max="100"> %</div>
+                </div>
+                <div style="font-size:11px;color:var(--text-3);margin:12px 0 8px;">Strategy-specific</div>
+                <div class="config-grid">
+                    <div class="config-item"><label>Fin Min Edge</label><input type="number" id="cfg-fin-min-edge" value="2" step="0.5" min="0.5" max="20"> %</div>
+                    <div class="config-item"><label>Fin Position Size</label><input type="number" id="cfg-fin-position-size" value="10" step="5" min="1" max="100"></div>
+                    <div class="config-item"><label>Max Orders</label><input type="number" id="cfg-max-orders" value="20" step="5" min="5" max="200"></div>
+                </div>
+                <button class="save-config-btn" onclick="saveConfig()">Save Config</button>
             </div>
         </section>
-
-        <!-- S&P Above Section -->
-        <section class="section" id="section-spx-above">
-            <div class="futures-badge">
-                <span style="color: var(--text-3)">SPX Index (^GSPC):</span>
-                <span class="price" id="es-price-1">-</span>
-                <span class="change" id="es-change-1">-</span>
-            </div>
-
-            <div class="table-container">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Strike</th>
-                            <th class="text-right">Market (YES)</th>
-                            <th class="text-right">Model (YES)</th>
-                            <th class="text-right">Best Trade</th>
-                            <th class="text-right">Action</th>
-                        </tr>
-                    </thead>
-                    <tbody id="spx-above-table">
-                        <tr><td colspan="5" class="loading"><div class="spinner"></div> Loading...</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </section>
-
-        <!-- S&P Range Section -->
-        <section class="section" id="section-spx-range">
-            <div class="futures-badge">
-                <span style="color: var(--text-3)">SPX Index (^GSPC):</span>
-                <span class="price" id="es-price-2">-</span>
-                <span class="change" id="es-change-2">-</span>
-            </div>
-
-            <div class="table-container">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Range</th>
-                            <th class="text-right">Market (YES)</th>
-                            <th class="text-right">Model (YES)</th>
-                            <th class="text-right">Best Trade</th>
-                            <th class="text-right">Action</th>
-                        </tr>
-                    </thead>
-                    <tbody id="spx-range-table">
-                        <tr><td colspan="5" class="loading"><div class="spinner"></div> Loading...</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </section>
-
-        <!-- Treasury 10Y Section -->
-        <section class="section" id="section-treasury">
-            <div class="futures-badge">
-                <span style="color: var(--text-3)">10Y Yield:</span>
-                <span class="price" id="t10y-yield">-</span>
-                <span class="change" id="t10y-change">-</span>
-            </div>
-
-            <div class="table-container">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Yield Range</th>
-                            <th class="text-right">Market (YES)</th>
-                            <th class="text-right">Model (YES)</th>
-                            <th class="text-right">Best Trade</th>
-                            <th class="text-right">Action</th>
-                        </tr>
-                    </thead>
-                    <tbody id="treasury-table">
-                        <tr><td colspan="5" class="loading"><div class="spinner"></div> Loading...</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </section>
-
-        <!-- USD/JPY Section -->
-        <section class="section" id="section-usdjpy">
-            <div class="futures-badge">
-                <span style="color: var(--text-3)">USD/JPY:</span>
-                <span class="price" id="usdjpy-price">-</span>
-                <span class="change" id="usdjpy-change">-</span>
-            </div>
-
-            <div class="table-container">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Price Range</th>
-                            <th class="text-right">Market (YES)</th>
-                            <th class="text-right">Model (YES)</th>
-                            <th class="text-right">Best Trade</th>
-                            <th class="text-right">Action</th>
-                        </tr>
-                    </thead>
-                    <tbody id="usdjpy-table">
-                        <tr><td colspan="5" class="loading"><div class="spinner"></div> Loading...</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </section>
-
-        <!-- EUR/USD Section -->
-        <section class="section" id="section-eurusd">
-            <div class="futures-badge">
-                <span style="color: var(--text-3)">EUR/USD:</span>
-                <span class="price" id="eurusd-price">-</span>
-                <span class="change" id="eurusd-change">-</span>
-            </div>
-
-            <div class="table-container">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Price Range</th>
-                            <th class="text-right">Market (YES)</th>
-                            <th class="text-right">Model (YES)</th>
-                            <th class="text-right">Best Trade</th>
-                            <th class="text-right">Action</th>
-                        </tr>
-                    </thead>
-                    <tbody id="eurusd-table">
-                        <tr><td colspan="5" class="loading"><div class="spinner"></div> Loading...</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </section>
-
-        <!-- WTI Crude Oil Section -->
-        <section class="section" id="section-wti">
-            <div class="futures-badge">
-                <span style="color: var(--text-3)">WTI Crude:</span>
-                <span class="price" id="wti-price">-</span>
-                <span class="change" id="wti-change">-</span>
-            </div>
-
-            <div class="table-container">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Price Range</th>
-                            <th class="text-right">Market (YES)</th>
-                            <th class="text-right">Model (YES)</th>
-                            <th class="text-right">Best Trade</th>
-                            <th class="text-right">Action</th>
-                        </tr>
-                    </thead>
-                    <tbody id="wti-table">
-                        <tr><td colspan="5" class="loading"><div class="spinner"></div> Loading...</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </section>
-
-        <!-- Bitcoin Section -->
-        <section class="section" id="section-bitcoin">
-            <div class="futures-badge">
-                <span style="color: var(--text-3)">Bitcoin:</span>
-                <span class="price" id="bitcoin-price">-</span>
-                <span class="change" id="bitcoin-change">-</span>
-            </div>
-            <div class="table-container">
-                <table>
-                    <thead><tr><th>Price Range</th><th class="text-right">Market (YES)</th><th class="text-right">Model (YES)</th><th class="text-right">Best Trade</th><th class="text-right">Action</th></tr></thead>
-                    <tbody id="bitcoin-table"><tr><td colspan="5" class="loading"><div class="spinner"></div> Loading...</td></tr></tbody>
-                </table>
-            </div>
-        </section>
-
-        <!-- Ethereum Section -->
-        <section class="section" id="section-ethereum">
-            <div class="futures-badge">
-                <span style="color: var(--text-3)">Ethereum:</span>
-                <span class="price" id="ethereum-price">-</span>
-                <span class="change" id="ethereum-change">-</span>
-            </div>
-            <div class="table-container">
-                <table>
-                    <thead><tr><th>Price Range</th><th class="text-right">Market (YES)</th><th class="text-right">Model (YES)</th><th class="text-right">Best Trade</th><th class="text-right">Action</th></tr></thead>
-                    <tbody id="ethereum-table"><tr><td colspan="5" class="loading"><div class="spinner"></div> Loading...</td></tr></tbody>
-                </table>
-            </div>
-        </section>
-
-        <!-- Solana Section -->
-        <section class="section" id="section-solana">
-            <div class="futures-badge">
-                <span style="color: var(--text-3)">Solana:</span>
-                <span class="price" id="solana-price">-</span>
-                <span class="change" id="solana-change">-</span>
-            </div>
-            <div class="table-container">
-                <table>
-                    <thead><tr><th>Price Range</th><th class="text-right">Market (YES)</th><th class="text-right">Model (YES)</th><th class="text-right">Best Trade</th><th class="text-right">Action</th></tr></thead>
-                    <tbody id="solana-table"><tr><td colspan="5" class="loading"><div class="spinner"></div> Loading...</td></tr></tbody>
-                </table>
-            </div>
-        </section>
-
-        <!-- Dogecoin Section -->
-        <section class="section" id="section-dogecoin">
-            <div class="futures-badge">
-                <span style="color: var(--text-3)">Dogecoin:</span>
-                <span class="price" id="dogecoin-price">-</span>
-                <span class="change" id="dogecoin-change">-</span>
-            </div>
-            <div class="table-container">
-                <table>
-                    <thead><tr><th>Price Range</th><th class="text-right">Market (YES)</th><th class="text-right">Model (YES)</th><th class="text-right">Best Trade</th><th class="text-right">Action</th></tr></thead>
-                    <tbody id="dogecoin-table"><tr><td colspan="5" class="loading"><div class="spinner"></div> Loading...</td></tr></tbody>
-                </table>
-            </div>
-        </section>
-
-        <!-- XRP Section -->
-        <section class="section" id="section-xrp">
-            <div class="futures-badge">
-                <span style="color: var(--text-3)">XRP:</span>
-                <span class="price" id="xrp-price">-</span>
-                <span class="change" id="xrp-change">-</span>
-            </div>
-            <div class="table-container">
-                <table>
-                    <thead><tr><th>Price Range</th><th class="text-right">Market (YES)</th><th class="text-right">Model (YES)</th><th class="text-right">Best Trade</th><th class="text-right">Action</th></tr></thead>
-                    <tbody id="xrp-table"><tr><td colspan="5" class="loading"><div class="spinner"></div> Loading...</td></tr></tbody>
-                </table>
-            </div>
-        </section>
-
     </div>
 
     <script>
-        // Tab switching
-        document.querySelectorAll('.tab').forEach(tab => {
-            tab.addEventListener('click', () => {
-                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-                document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
-                tab.classList.add('active');
-                document.getElementById('section-' + tab.dataset.tab).classList.add('active');
-            });
+    // ---- STATE ----
+    let lastDataTime = Date.now();
+    let cachedConfig = null;
+    let dataIntervalId = null;
+    let statusIntervalId = null;
+    let freshnessIntervalId = null;
+
+    const ASSET_MAP = [
+        ['nasdaq', 'above', 'NDX', 'NDX Above'],
+        ['nasdaq', 'range', 'NDX', 'NDX Range'],
+        ['spx', 'above', 'SPX', 'SPX Above'],
+        ['spx', 'range', 'SPX', 'SPX Range'],
+        ['treasury10y', 'markets', '10Y', '10Y Treasury'],
+        ['usdjpy', 'markets', 'JPY', 'USD/JPY'],
+        ['eurusd', 'markets', 'EUR', 'EUR/USD'],
+        ['wti', 'markets', 'WTI', 'WTI Oil'],
+        ['bitcoin', 'markets', 'BTC', 'Bitcoin'],
+        ['ethereum', 'markets', 'ETH', 'Ethereum'],
+        ['solana', 'markets', 'SOL', 'Solana'],
+        ['dogecoin', 'markets', 'DOGE', 'Dogecoin'],
+        ['xrp', 'markets', 'XRP', 'XRP'],
+    ];
+
+    const ERROR_COLORS = {
+        'network':'#f97316','api_rejection':'#ef4444','rate_limit':'#eab308',
+        'order_failure':'#a855f7','data_quality':'#3b82f6','unknown':'#71717a',
+    };
+    const ERROR_THRESHOLDS = {'network':10,'rate_limit':5,'order_failure':30};
+
+    // ---- UTILS ----
+    function esc(s) {
+        if (s == null) return '';
+        const d = document.createElement('div'); d.textContent = String(s); return d.innerHTML;
+    }
+    function fmt(n, decimals=2) {
+        if (n == null) return '-';
+        return n.toLocaleString('en-US',{minimumFractionDigits:decimals,maximumFractionDigits:decimals});
+    }
+    function pct(n) { return n == null ? '-' : (n*100).toFixed(1)+'%'; }
+    function edgeBadge(edge, side) {
+        if (edge == null || edge < 0.01) return '<span class="text-muted">-</span>';
+        return `<span class="edge positive">${side} +${(edge*100).toFixed(1)}%</span>`;
+    }
+    function ageClass(s) {
+        if (s > 120) return 'age-expired';
+        if (s > 60) return 'age-critical';
+        if (s > 30) return 'age-stale';
+        return 'age-normal';
+    }
+    function formatExpiry(ct) {
+        if (!ct) return '';
+        const d = new Date(ct) - new Date();
+        if (d <= 0) return 'Exp';
+        const h = Math.floor(d/3600000), m = Math.floor((d%3600000)/60000);
+        if (h < 24) return h > 0 ? h+'h '+m+'m' : m+'m';
+        return new Date(ct).toLocaleDateString('en-US',{month:'short',day:'numeric'});
+    }
+
+    function computeAction(m) {
+        if (m.recommendation) {
+            const r = m.recommendation;
+            return `<span class="text-green">${r.side} ${r.size}x @ ${r.price}c</span>`;
+        }
+        if (m.mm_suggestion) {
+            const mm = m.mm_suggestion;
+            return `<span class="text-blue">MM: ${mm.side} @ ${mm.price}c</span>`;
+        }
+        if (m.best_edge && m.best_edge >= 0.02) {
+            const fy = Math.round(m.fair_value*100), fn = 100-fy;
+            if (m.best_side==='YES' && fy > 2) {
+                const ya = m.yes_ask||0;
+                const bp = ya>0&&fy>ya ? Math.max(2,ya-1) : Math.max(2,Math.min(fy-1,(m.yes_bid||0)+1));
+                return `<span class="text-green">Bid YES @ ${bp}c</span>`;
+            }
+            if (m.best_side==='NO' && fn > 2) {
+                const na = m.yes_bid?(100-m.yes_bid):0, nb = m.yes_ask?(100-m.yes_ask):0;
+                const bp = na>0&&fn>na ? Math.max(2,na-1) : Math.max(2,Math.min(fn-1,(nb||0)+1));
+                return `<span class="text-green">Bid NO @ ${bp}c</span>`;
+            }
+        }
+        return `${m.yes_bid||'-'}c / ${m.yes_ask||'-'}c`;
+    }
+
+    // ---- TABS ----
+    document.querySelectorAll('.tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+            tab.classList.add('active');
+            document.getElementById('section-'+tab.dataset.tab).classList.add('active');
         });
+    });
 
-        // Escape HTML entities in strings to prevent XSS
-        function esc(s) {
-            if (s === null || s === undefined) return '';
-            const div = document.createElement('div');
-            div.textContent = String(s);
-            return div.innerHTML;
+    // ---- RISK BAR ----
+    function updateRiskBar(d) {
+        document.getElementById('rb-balance').textContent = '$'+fmt(d.balance||0);
+
+        const pnl = d.daily_pnl||0, pp = d.daily_pnl_pct||0;
+        const pe = document.getElementById('rb-daily-pnl');
+        pe.textContent = `$${fmt(pnl)} (${pp>=0?'+':''}${pp.toFixed(1)}%)`;
+        pe.style.color = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+
+        const sb = d.starting_balance||d.balance||1;
+        const mlp = cachedConfig ? cachedConfig.max_daily_loss_pct : 0.05;
+        const ml = sb * mlp;
+        const pr = ml > 0 ? Math.min(Math.abs(pnl)/ml,1) : 0;
+        const pg = document.getElementById('rb-pnl-gauge');
+        pg.style.width = (pr*100)+'%';
+        pg.className = 'gauge-fill '+(pnl>=0?'ok':(pr>0.8?'danger':pr>0.5?'warn':'ok'));
+
+        const cp = d.capital_pct_used||0;
+        const me = cachedConfig ? cachedConfig.max_total_exposure : 0.8;
+        const er = me > 0 ? Math.min((cp/100)/me,1) : 0;
+        document.getElementById('rb-exposure').textContent = cp.toFixed(1)+'%';
+        const eg = document.getElementById('rb-exposure-gauge');
+        eg.style.width = (er*100)+'%';
+        eg.className = 'gauge-fill '+(er>0.8?'danger':er>0.5?'warn':'ok');
+
+        const se = document.getElementById('rb-status');
+        if (d.halted) {
+            se.innerHTML = `<span class="status-dot halted"></span> HALTED: ${esc(d.halt_reason||'Unknown')}`;
+            se.style.color = 'var(--red)';
+        } else if (d.enabled) {
+            se.innerHTML = `<span class="status-dot running"></span> Running (${d.active_orders||0} orders)`;
+            se.style.color = '';
+        } else {
+            se.innerHTML = `<span class="status-dot stopped"></span> Stopped`;
+            se.style.color = '';
         }
 
-        // Format number with commas
-        function fmt(n, decimals = 2) {
-            if (n === null || n === undefined) return '-';
-            return n.toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+        const mb = document.getElementById('rb-mode');
+        if (d.dry_run) {
+            mb.textContent = 'DRY RUN'; mb.className = 'mode-badge dry-run';
+            document.body.classList.add('dry-run');
+        } else {
+            mb.textContent = 'LIVE'; mb.className = 'mode-badge live';
+            document.body.classList.remove('dry-run');
         }
 
-        // Format percent
-        function pct(n) {
-            if (n === null || n === undefined) return '-';
-            return (n * 100).toFixed(1) + '%';
+        const errs = d.errors||{}, ec = errs.total_in_window||0;
+        const ee = document.getElementById('rb-error-count');
+        ee.textContent = ec;
+        ee.className = ec > 0 ? 'error-count has-errors' : 'error-count';
+        if (ec === 0) document.getElementById('error-panel').classList.remove('open');
+        updateErrorPanel(errs);
+    }
+
+    // ---- ERROR PANEL ----
+    function toggleErrorPanel() { document.getElementById('error-panel').classList.toggle('open'); }
+    function updateErrorPanel(errors) {
+        const bt = errors.by_type||{}, rc = errors.recent||[], tot = errors.total_in_window||0;
+        const bar = document.getElementById('error-bar');
+        bar.innerHTML = tot > 0 ? Object.entries(bt).map(([t,c]) => {
+            const p = (c/tot)*100, cl = ERROR_COLORS[t]||ERROR_COLORS['unknown'];
+            return `<div class="error-bar-segment" style="width:${p}%;background:${cl};" title="${t}: ${c}"></div>`;
+        }).join('') : '';
+
+        document.getElementById('error-thresholds').innerHTML = Object.entries(bt).map(([t,c]) => {
+            const mx = ERROR_THRESHOLDS[t];
+            if (!mx) return `${t}: ${c}`;
+            const cl = c>=mx*0.8?'var(--red)':c>=mx*0.5?'var(--orange)':'var(--text-3)';
+            return `<span style="color:${cl}">${t}: ${c}/${mx}</span>`;
+        }).join(' &middot; ');
+
+        const le = document.getElementById('error-list');
+        le.innerHTML = rc.length > 0 ? rc.map(e => {
+            const tm = new Date(e.time).toLocaleTimeString();
+            const cl = ERROR_COLORS[e.type]||ERROR_COLORS['unknown'];
+            return `<li><span style="color:var(--text-3);min-width:65px;">${tm}</span>` +
+                `<span class="error-type-badge" style="background:${cl}22;color:${cl};">${e.type}</span>` +
+                `<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(e.message)}</span></li>`;
+        }).join('') : '<li style="color:var(--text-3);">No recent errors</li>';
+    }
+
+    // ---- KILL SWITCH ----
+    async function killSwitch() {
+        if (!confirm('KILL SWITCH: Stop trading AND cancel ALL resting orders?')) return;
+        try {
+            await fetch('/api/auto-trader/stop',{method:'POST'});
+            const r = await fetch('/api/auto-trader/cancel-all',{method:'POST'});
+            const d = await r.json();
+            alert('Stopped. Cancelled '+d.cancelled+' orders.');
+            loadAutoTraderStatus();
+        } catch(e) { alert('Kill switch error: '+e); }
+    }
+
+    // ---- POSITIONS ----
+    function renderPositions(positions) {
+        const c = document.getElementById('positions-container');
+        if (!positions || !positions.length) {
+            c.innerHTML = '<div class="empty"><p>No open positions</p></div>'; return;
         }
-
-        // Format edge badge with side indicator
-        function edgeBadge(edge, side) {
-            if (edge === null || edge === undefined || edge < 0.01) return '<span class="text-muted">-</span>';
-            const cls = 'positive';
-            return `<span class="edge ${cls}">${side} +${(edge * 100).toFixed(1)}%</span>`;
-        }
-
-        // Render positions
-        function renderPositions(positions) {
-            const container = document.getElementById('positions-container');
-
-            if (!positions || positions.length === 0) {
-                container.innerHTML = `
-                    <div class="empty">
-                        <div class="empty-icon" style="font-size: 14px; font-weight: 500;">--</div>
-                        <p>No open positions</p>
-                    </div>
-                `;
-                return;
-            }
-
-            container.innerHTML = positions.map(pos => `
-                <div class="position-card">
-                    <div class="position-header">
-                        <div>
-                            <div class="position-title">${esc(pos.title)}</div>
-                            <div class="position-ticker">${esc(pos.ticker)}</div>
-                        </div>
-                        <div class="position-side ${pos.side.toLowerCase()}">${pos.side} × ${pos.quantity}</div>
-                    </div>
-                    <div class="position-grid">
-                        <div class="position-metric">
-                            <div class="position-metric-label">Entry</div>
-                            <div class="position-metric-value">${pct(pos.avg_price)}</div>
-                        </div>
-                        <div class="position-metric">
-                            <div class="position-metric-label">Market</div>
-                            <div class="position-metric-value">${pct(pos.current_mid)}</div>
-                        </div>
-                        <div class="position-metric">
-                            <div class="position-metric-label">Model</div>
-                            <div class="position-metric-value">${pct(pos.fair_value)}</div>
-                        </div>
-                        <div class="position-metric">
-                            <div class="position-metric-label">P&L</div>
-                            <div class="position-metric-value ${pos.unrealized_pnl >= 0 ? 'text-green' : 'text-red'}">
-                                $${fmt(pos.unrealized_pnl)}
-                            </div>
-                        </div>
-                    </div>
+        c.innerHTML = positions.map(p => `
+            <div class="position-card">
+                <div class="position-header">
+                    <div><div class="position-title">${esc(p.title)}</div>
+                    <div class="position-ticker">${esc(p.ticker)}</div></div>
+                    <div class="position-side ${p.side.toLowerCase()}">${p.side} x ${p.quantity}</div>
                 </div>
-            `).join('');
+                <div class="position-grid">
+                    <div class="position-metric"><div class="position-metric-label">Entry</div>
+                        <div class="position-metric-value">${pct(p.avg_price)}</div></div>
+                    <div class="position-metric"><div class="position-metric-label">Market</div>
+                        <div class="position-metric-value">${pct(p.current_mid)}</div></div>
+                    <div class="position-metric"><div class="position-metric-label">Model</div>
+                        <div class="position-metric-value">${pct(p.fair_value)}</div></div>
+                    <div class="position-metric"><div class="position-metric-label">P&L</div>
+                        <div class="position-metric-value ${p.unrealized_pnl>=0?'text-green':'text-red'}">$${fmt(p.unrealized_pnl)}</div></div>
+                </div>
+            </div>`).join('');
+    }
+
+    // ---- OPPORTUNITIES ----
+    function renderOpportunities(all) {
+        const tb = document.getElementById('opportunities-table');
+        const f = all.filter(m => m.best_edge >= 0.01).sort((a,b) => (b.best_edge||0)-(a.best_edge||0));
+        if (!f.length) {
+            tb.innerHTML = '<tr><td colspan="8" class="text-muted" style="text-align:center;padding:32px;">No opportunities with edge &ge; 1%</td></tr>';
+            return;
         }
+        tb.innerHTML = f.slice(0,50).map(m => {
+            const st = m.title&&m.title.length>40 ? m.title.slice(0,37)+'...' : (m.title||m.ticker);
+            return `<tr class="clickable" onclick="showOrderbook('${m.ticker}')" title="${esc(m.title||m.ticker)}">
+                <td><span class="asset-badge">${m.asset}</span></td>
+                <td><span class="mono">${esc(m.range)}</span>
+                    <div style="font-size:10px;color:var(--text-3);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(st)}</div></td>
+                <td style="font-size:12px;color:var(--text-2);">${formatExpiry(m.close_time)}</td>
+                <td class="text-right mono">${pct(m.market_price)}</td>
+                <td class="text-right mono">${pct(m.fair_value)}</td>
+                <td class="text-right">${edgeBadge(m.best_edge,m.best_side)}</td>
+                <td class="text-right mono" style="font-size:12px;">${computeAction(m)}</td>
+                <td class="text-right text-muted">${m.volume||0}</td>
+            </tr>`;
+        }).join('');
+    }
 
-        // Render market table
-        function renderMarkets(markets, tableId, futuresPrice, isYieldBased = false) {
-            const tbody = document.getElementById(tableId);
+    // ---- ACCORDIONS ----
+    const SECTIONS = [
+        {k:'nasdaq',s:'above',l:'NDX Above',pf:'futures'},
+        {k:'nasdaq',s:'range',l:'NDX Range',pf:'futures'},
+        {k:'spx',s:'above',l:'SPX Above',pf:'futures'},
+        {k:'spx',s:'range',l:'SPX Range',pf:'futures'},
+        {k:'treasury10y',s:'markets',l:'10Y Treasury',pf:'quote'},
+        {k:'usdjpy',s:'markets',l:'USD/JPY',pf:'quote'},
+        {k:'eurusd',s:'markets',l:'EUR/USD',pf:'quote'},
+        {k:'wti',s:'markets',l:'WTI Oil',pf:'quote'},
+        {k:'bitcoin',s:'markets',l:'Bitcoin',pf:'quote'},
+        {k:'ethereum',s:'markets',l:'Ethereum',pf:'quote'},
+        {k:'solana',s:'markets',l:'Solana',pf:'quote'},
+        {k:'dogecoin',s:'markets',l:'Dogecoin',pf:'quote'},
+        {k:'xrp',s:'markets',l:'XRP',pf:'quote'},
+    ];
 
-            if (!markets || markets.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5" class="text-muted" style="text-align:center">No markets</td></tr>';
-                return;
+    function renderAccordions(data) {
+        const c = document.getElementById('asset-accordions');
+        c.innerHTML = SECTIONS.map((s,i) => {
+            const d = data[s.k]; if (!d) return '';
+            const mkts = d[s.s]||[];
+            const ec = mkts.filter(m => m.best_edge>=0.01).length;
+            const q = d[s.pf];
+            const price = q?.price||q?.yield;
+            const ch = q?.change_pct||q?.change||0;
+            let ps = price!=null ? (price>1000?fmt(price,2):price.toFixed(price<10?4:3)) : '';
+            return `<details class="accordion-section" id="acc-${i}">
+                <summary><span>${s.l}</span>
+                    ${ps ? `<span class="futures-inline"><span class="fp">${ps}</span><span class="fc ${ch>=0?'text-green':'text-red'}">${ch>=0?'+':''}${typeof ch==='number'?ch.toFixed(2):ch}%</span></span>` : ''}
+                    <span style="margin-left:auto;font-size:12px;color:var(--text-3);">${mkts.length} mkts${ec>0?', '+ec+' edge':''}</span>
+                </summary>
+                <div class="accordion-content"><table>
+                    <thead><tr><th>Strike/Range</th><th class="text-right">Market</th><th class="text-right">Model</th><th class="text-right">Edge</th><th class="text-right">Action</th></tr></thead>
+                    <tbody id="acc-tb-${i}"></tbody>
+                </table></div>
+            </details>`;
+        }).join('');
+
+        SECTIONS.forEach((s,i) => {
+            const d = data[s.k]; if (!d) return;
+            const tb = document.getElementById('acc-tb-'+i);
+            if (tb) renderMarketsInTable(d[s.s]||[],tb);
+        });
+    }
+
+    function renderMarketsInTable(mkts,tb) {
+        if (!mkts||!mkts.length) { tb.innerHTML='<tr><td colspan="5" class="text-muted" style="text-align:center">No markets</td></tr>'; return; }
+        mkts.sort((a,b) => Math.abs(a.distance)-Math.abs(b.distance));
+        tb.innerHTML = mkts.slice(0,25).map(m => {
+            const he = m.best_edge&&m.best_edge>=0.02;
+            const st = m.title&&m.title.length>50?m.title.slice(0,47)+'...':(m.title||m.ticker);
+            const ex = formatExpiry(m.close_time);
+            return `<tr class="${he?'clickable':''}" ${he?`onclick="showOrderbook('${m.ticker}')"`:''} title="${esc(m.title||m.ticker)}">
+                <td><span class="mono">${esc(m.range)}</span>
+                    <div style="font-size:10px;color:var(--text-3);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(st)}${ex?' &middot; '+ex:''}</div></td>
+                <td class="text-right mono">${pct(m.market_price)}</td>
+                <td class="text-right mono">${pct(m.fair_value)}</td>
+                <td class="text-right">${edgeBadge(m.best_edge,m.best_side)}</td>
+                <td class="text-right mono" style="font-size:12px;">${computeAction(m)}</td>
+            </tr>`;
+        }).join('');
+    }
+
+    // ---- ORDERBOOK MODAL ----
+    async function showOrderbook(ticker) {
+        try {
+            const r = await fetch('/api/orderbook/'+ticker);
+            const d = await r.json();
+            if (d.error) { console.error(d.error); return; }
+            const mt = d.market?.title||ticker;
+            const ct = d.market?.close_time ? new Date(d.market.close_time).toLocaleString() : '';
+            let h = `<div class="modal-overlay" onclick="closeModal()">
+                <div class="modal" onclick="event.stopPropagation()">
+                <div class="modal-header"><h3 style="font-size:14px;line-height:1.3;">${mt}</h3>
+                    <button onclick="closeModal()" class="modal-close">&times;</button></div>
+                ${ct?`<div style="padding:0 16px;font-size:11px;color:var(--text-3);">Expires: ${ct}</div>`:''}
+                <div class="modal-body"><div class="ob-section"><h4>Orderbook</h4>
+                <div class="ob-grid"><div><div class="ob-header">BIDS (YES)</div>
+                ${d.orderbook.yes_bids.map(l=>`<div class="ob-level bid">${l.price}c <span class="qty">${l.qty}</span></div>`).join('')}
+                </div><div><div class="ob-header">ASKS (YES)</div>
+                ${d.orderbook.yes_asks.map(l=>`<div class="ob-level ask">${l.price}c <span class="qty">${l.qty}</span></div>`).join('')}
+                </div></div>
+                <div class="ob-stats">Spread: ${d.orderbook.spread}c | Mid: ${fmt(d.orderbook.mid,1)}c</div></div>`;
+            if (d.recommendation) {
+                const rc = d.recommendation;
+                h += `<div class="rec-section"><h4>Recommendation</h4><div class="rec-card">
+                    <div class="rec-action">Buy ${rc.size} ${rc.side} @ ${rc.price}c</div>
+                    <div class="rec-stats">Edge: ${(rc.edge*100).toFixed(1)}% | Fill: ${(rc.fill_prob*100).toFixed(0)}% | EV: $${rc.expected_value.toFixed(2)}</div>
+                    <div class="rec-reasoning">${rc.reasoning}</div></div></div>`;
+            }
+            h += '</div></div></div>';
+            document.body.insertAdjacentHTML('beforeend', h);
+        } catch(e) { console.error('Failed to load orderbook:',e); }
+    }
+    function closeModal() { const m=document.querySelector('.modal-overlay'); if(m)m.remove(); }
+
+    // ---- AUTO-TRADER ----
+    async function loadAutoTraderStatus() {
+        try {
+            const r = await fetch('/api/auto-trader/status');
+            const d = await r.json();
+            updateRiskBar(d);
+
+            const startBtn=document.getElementById('start-trading-btn');
+            const stopBtn=document.getElementById('stop-trading-btn');
+            const resetBtn=document.getElementById('reset-halt-btn');
+            const dryBtn=document.getElementById('dry-run-toggle');
+
+            if (d.dry_run) {
+                dryBtn.textContent='GO LIVE'; dryBtn.style.background='var(--green)'; dryBtn.style.color='white';
+            } else {
+                dryBtn.textContent='DRY RUN'; dryBtn.style.background='var(--bg-3)'; dryBtn.style.color='var(--text-1)';
             }
 
-            // Sort by distance from current price
-            markets.sort((a, b) => Math.abs(a.distance) - Math.abs(b.distance));
-
-            tbody.innerHTML = markets.slice(0, 25).map(m => {
-                // Near money threshold: 500 points for equities, 0.1% for yields
-                const nearMoneyThreshold = isYieldBased ? 0.1 : 500;
-                const isNearMoney = Math.abs(m.distance) < nearMoneyThreshold;
-                const hasEdge = m.best_edge && m.best_edge >= 0.02;
-                const hasRec = m.recommendation;
-
-                // Show recommendation if available, market making suggestion, or bid/ask
-                let actionText = '';
-                const hasMM = m.mm_suggestion;  // Market making opportunity
-
-                if (hasRec) {
-                    const r = m.recommendation;
-                    actionText = `<span class="text-green">${r.side} ${r.size}x @ ${r.price}c</span>`;
-                } else if (hasMM) {
-                    // Market making suggestion (wide spread liquidity provision)
-                    const mm = m.mm_suggestion;
-                    const edgePct = Math.round(mm.edge * 100);
-                    actionText = `<span class="text-blue" title="Market Making: ${edgePct}% edge if filled">MM: ${mm.side} @ ${mm.price}c</span>`;
-                } else if (hasEdge) {
-                    // Calculate fair price and suggest a limit order with edge
-                    const fairYes = Math.round(m.fair_value * 100);
-                    const fairNo = 100 - fairYes;
-
-                    if (m.best_side === 'YES' && fairYes > 2) {
-                        // Bid for YES: aggressive near ask when FV > ask, else passive near bid
-                        const yesAsk = m.yes_ask || 0;
-                        let bidPrice;
-                        if (yesAsk > 0 && fairYes > yesAsk) {
-                            bidPrice = Math.max(2, yesAsk - 1);
-                        } else {
-                            bidPrice = Math.max(2, Math.min(fairYes - 1, (m.yes_bid || 0) + 1));
-                        }
-                        actionText = `<span class="text-green">Bid YES @ ${bidPrice}c</span>`;
-                    } else if (m.best_side === 'NO' && fairNo > 2) {
-                        // Bid for NO: aggressive near ask when FV > ask, else passive near bid
-                        const noAsk = m.yes_bid ? (100 - m.yes_bid) : 0;
-                        const noBid = m.yes_ask ? (100 - m.yes_ask) : 0;
-                        let bidPrice;
-                        if (noAsk > 0 && fairNo > noAsk) {
-                            bidPrice = Math.max(2, noAsk - 1);
-                        } else {
-                            bidPrice = Math.max(2, Math.min(fairNo - 1, (noBid || 0) + 1));
-                        }
-                        actionText = `<span class="text-green">Bid NO @ ${bidPrice}c</span>`;
-                    } else {
-                        actionText = `${m.yes_bid}c / ${m.yes_ask}c`;
-                    }
-                } else {
-                    actionText = `${m.yes_bid}c / ${m.yes_ask}c`;
-                }
-
-                // Format close time for display
-                let expiryStr = '';
-                if (m.close_time) {
-                    const closeDate = new Date(m.close_time);
-                    const now = new Date();
-                    const diffMs = closeDate - now;
-                    const diffHours = Math.floor(diffMs / (1000 * 60 * 60));
-                    const diffMins = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
-                    if (diffHours < 24) {
-                        expiryStr = diffHours > 0 ? `${diffHours}h ${diffMins}m` : `${diffMins}m`;
-                    } else {
-                        expiryStr = closeDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-                    }
-                }
-
-                // Truncate title for display
-                const shortTitle = m.title && m.title.length > 60 ? m.title.slice(0, 57) + '...' : (m.title || m.ticker);
-
-                return `
-                    <tr style="${isNearMoney ? 'background: var(--bg-2)' : ''}"
-                        onclick="showOrderbook('${m.ticker}')"
-                        class="${hasEdge ? 'clickable' : ''}"
-                        title="${esc(m.title || m.ticker)}">
-                        <td>
-                            <span class="mono">${esc(m.range)}</span>
-                            <div style="font-size: 10px; color: var(--text-3); max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-                                ${esc(shortTitle)}${expiryStr ? ' · ' + expiryStr : ''}
-                            </div>
-                        </td>
-                        <td class="text-right mono">${pct(m.market_price)}</td>
-                        <td class="text-right mono">${pct(m.fair_value)}</td>
-                        <td class="text-right">${edgeBadge(m.best_edge, m.best_side)}</td>
-                        <td class="text-right mono">${actionText}</td>
-                    </tr>
-                `;
-            }).join('');
-        }
-
-        // Show orderbook modal
-        async function showOrderbook(ticker) {
-            try {
-                const resp = await fetch('/api/orderbook/' + ticker);
-                const data = await resp.json();
-                if (data.error) {
-                    console.error(data.error);
-                    return;
-                }
-
-                // Format title and close time
-                const marketTitle = data.market?.title || ticker;
-                const closeTime = data.market?.close_time ? new Date(data.market.close_time).toLocaleString() : '';
-
-                // Build modal content
-                let html = `<div class="modal-overlay" onclick="closeModal()">
-                    <div class="modal" onclick="event.stopPropagation()">
-                        <div class="modal-header">
-                            <h3 style="font-size: 14px; line-height: 1.3;">${marketTitle}</h3>
-                            <button onclick="closeModal()" class="modal-close">&times;</button>
-                        </div>
-                        ${closeTime ? `<div style="padding: 0 16px; font-size: 11px; color: var(--text-3);">Expires: ${closeTime}</div>` : ''}
-                        <div class="modal-body">
-                            <div class="ob-section">
-                                <h4>Orderbook</h4>
-                                <div class="ob-grid">
-                                    <div class="ob-side">
-                                        <div class="ob-header">BIDS (YES)</div>
-                                        ${data.orderbook.yes_bids.map(l =>
-                                            `<div class="ob-level bid">${l.price}c <span class="qty">${l.qty}</span></div>`
-                                        ).join('')}
-                                    </div>
-                                    <div class="ob-side">
-                                        <div class="ob-header">ASKS (YES)</div>
-                                        ${data.orderbook.yes_asks.map(l =>
-                                            `<div class="ob-level ask">${l.price}c <span class="qty">${l.qty}</span></div>`
-                                        ).join('')}
-                                    </div>
-                                </div>
-                                <div class="ob-stats">
-                                    Spread: ${data.orderbook.spread}c | Mid: ${fmt(data.orderbook.mid, 1)}c
-                                </div>
-                            </div>`;
-
-                if (data.recommendation) {
-                    const r = data.recommendation;
-                    html += `
-                            <div class="rec-section">
-                                <h4>Recommendation</h4>
-                                <div class="rec-card">
-                                    <div class="rec-action">Buy ${r.size} ${r.side} @ ${r.price}c</div>
-                                    <div class="rec-stats">
-                                        Edge: ${(r.edge * 100).toFixed(1)}% |
-                                        Fill Prob: ${(r.fill_prob * 100).toFixed(0)}% |
-                                        EV: $${r.expected_value.toFixed(2)}
-                                    </div>
-                                    <div class="rec-reasoning">${r.reasoning}</div>
-                                </div>
-                            </div>`;
-                }
-
-                html += `
-                        </div>
-                    </div>
-                </div>`;
-
-                document.body.insertAdjacentHTML('beforeend', html);
-            } catch (err) {
-                console.error('Failed to load orderbook:', err);
+            if (d.halted) {
+                startBtn.style.display='none'; stopBtn.style.display='none'; resetBtn.style.display='inline-block';
+            } else if (d.enabled) {
+                startBtn.style.display='none'; stopBtn.style.display='block'; resetBtn.style.display='none';
+            } else {
+                startBtn.style.display='block'; stopBtn.style.display='none'; resetBtn.style.display='none';
             }
-        }
 
-        function closeModal() {
-            const modal = document.querySelector('.modal-overlay');
-            if (modal) modal.remove();
-        }
-
-        // Auto-trader functions
-        async function loadAutoTraderStatus() {
-            try {
-                const resp = await fetch('/api/auto-trader/status');
-                const data = await resp.json();
-
-                const light = document.getElementById('trader-status-light');
-                const text = document.getElementById('trader-status-text');
-                const startBtn = document.getElementById('start-trading-btn');
-                const stopBtn = document.getElementById('stop-trading-btn');
-                const modeBadge = document.getElementById('trader-mode-badge');
-                const resetHaltBtn = document.getElementById('reset-halt-btn');
-                const dryRunBtn = document.getElementById('dry-run-toggle');
-
-                // Update mode badge
-                if (data.dry_run) {
-                    modeBadge.textContent = 'DRY RUN';
-                    modeBadge.style.background = 'var(--yellow)';
-                    modeBadge.style.color = '#000';
-                    dryRunBtn.textContent = 'GO LIVE';
-                    dryRunBtn.style.background = 'var(--green)';
-                    dryRunBtn.style.color = 'white';
-                } else {
-                    modeBadge.textContent = 'LIVE';
-                    modeBadge.style.background = 'var(--green)';
-                    modeBadge.style.color = 'white';
-                    dryRunBtn.textContent = 'DRY RUN';
-                    dryRunBtn.style.background = 'var(--bg-2)';
-                    dryRunBtn.style.color = 'var(--text-1)';
-                }
-
-                // Update status
-                if (data.halted) {
-                    light.classList.remove('running');
-                    light.style.background = 'var(--red)';
-                    text.textContent = `HALTED: ${data.halt_reason || 'Unknown'}`;
-                    text.style.color = 'var(--red)';
-                    startBtn.style.display = 'none';
-                    stopBtn.style.display = 'none';
-                    resetHaltBtn.style.display = 'inline-block';
-                } else if (data.enabled) {
-                    light.classList.add('running');
-                    light.style.background = '';
-                    text.textContent = `Running (${data.active_orders} orders)`;
-                    text.style.color = '';
-                    startBtn.style.display = 'none';
-                    stopBtn.style.display = 'block';
-                    resetHaltBtn.style.display = 'none';
-                } else {
-                    light.classList.remove('running');
-                    light.style.background = '';
-                    text.textContent = 'Stopped';
-                    text.style.color = '';
-                    startBtn.style.display = 'block';
-                    stopBtn.style.display = 'none';
-                    resetHaltBtn.style.display = 'none';
-                }
-
-                // Update stats (use API order count if available, shows real Kalshi orders)
-                const orderCount = data.api_order_count !== undefined ? data.api_order_count : (data.active_orders || 0);
-                document.getElementById('active-order-count').textContent = orderCount;
-                document.getElementById('total-positions').textContent = data.total_positions || 0;
-                document.getElementById('total-exposure').textContent = '$' + fmt(data.total_exposure || 0);
-                document.getElementById('trader-balance').textContent = '$' + fmt(data.balance || 0);
-
-                // Update daily P&L with color
-                const dailyPnl = data.daily_pnl || 0;
-                const dailyPnlPct = data.daily_pnl_pct || 0;
-                const pnlEl = document.getElementById('daily-pnl');
-                pnlEl.textContent = `$${fmt(dailyPnl)} (${dailyPnlPct >= 0 ? '+' : ''}${dailyPnlPct.toFixed(1)}%)`;
-                pnlEl.style.color = dailyPnl >= 0 ? 'var(--green)' : 'var(--red)';
-
-                // Update error count
-                const errors = data.errors || {};
-                const errorCount = errors.total_in_window || 0;
-                const errorEl = document.getElementById('error-count');
-                errorEl.textContent = errorCount;
-                errorEl.style.color = errorCount > 0 ? 'var(--yellow)' : '';
-
-                // Render active orders
-                const tbody = document.getElementById('active-orders-table');
-                if (!data.orders || data.orders.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="6" class="text-muted" style="text-align:center">No active orders</td></tr>';
-                } else {
-                    tbody.innerHTML = data.orders.map(o => {
-                        const shortTitle = o.title && o.title.length > 50 ? o.title.slice(0, 47) + '...' : (o.title || o.ticker);
-                        return `
-                        <tr title="${o.title || o.ticker}">
-                            <td>
-                                <div class="mono" style="font-size: 10px; color: var(--text-3);">${o.ticker.substring(0, 25)}...</div>
-                                <div style="font-size: 11px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${shortTitle}</div>
-                            </td>
-                            <td><span class="edge positive">${o.side.toUpperCase()}</span></td>
-                            <td class="text-right mono">${o.price}c</td>
-                            <td class="text-right">${o.size}</td>
-                            <td class="text-right">${(o.fair_value * 100).toFixed(1)}%</td>
-                            <td class="text-right text-muted">${Math.round(o.age_seconds)}s</td>
-                        </tr>
-                    `}).join('');
-                }
-
-                // Update fill stats
-                if (data.fill_stats) {
-                    const fs = data.fill_stats;
-                    document.getElementById('fill-total').textContent = fs.total_orders || 0;
-                    document.getElementById('fill-rate').textContent = fs.total_orders > 0
-                        ? (fs.fill_rate * 100).toFixed(1) + '%'
-                        : '--';
-                    document.getElementById('fill-time').textContent = fs.avg_time_to_fill > 0
-                        ? Math.round(fs.avg_time_to_fill) + 's'
-                        : '--';
-                    document.getElementById('adverse-selection').textContent = fs.total_orders > 0
-                        ? (fs.avg_adverse_selection * 100).toFixed(2) + '%'
-                        : '--';
-
-                    // Display learned fill rates by spread
-                    const spreadRates = fs.fill_rate_by_spread || {};
-                    const spreadEntries = Object.entries(spreadRates).sort((a, b) => parseInt(a[0]) - parseInt(b[0]));
-                    if (spreadEntries.length > 0 && fs.total_orders >= 10) {
-                        const ratesHtml = spreadEntries.map(([spread, rate]) =>
-                            `Spread ≤${spread}c: <strong>${(rate * 100).toFixed(0)}%</strong>`
-                        ).join(' | ');
-                        document.getElementById('fill-rates-by-spread').innerHTML =
-                            '<span style="color: var(--text-3);">Learned rates:</span> ' + ratesHtml;
-                    } else {
-                        document.getElementById('fill-rates-by-spread').innerHTML =
-                            '<span style="color: var(--text-3);">Need 10+ orders to calculate learned rates</span>';
-                    }
-                }
-            } catch (err) {
-                console.error('Failed to load auto-trader status:', err);
-            }
-        }
-
-        async function startAutoTrading() {
-            try {
-                await fetch('/api/auto-trader/start', {method: 'POST'});
-                loadAutoTraderStatus();
-            } catch (err) {
-                alert('Failed to start: ' + err);
-            }
-        }
-
-        async function stopAutoTrading() {
-            try {
-                await fetch('/api/auto-trader/stop', {method: 'POST'});
-                loadAutoTraderStatus();
-            } catch (err) {
-                alert('Failed to stop: ' + err);
-            }
-        }
-
-        async function cancelAllOrders() {
-            try {
-                const resp = await fetch('/api/auto-trader/cancel-all', {method: 'POST'});
-                const data = await resp.json();
-                alert(`Cancelled ${data.cancelled} orders`);
-                loadAutoTraderStatus();
-            } catch (err) {
-                alert('Failed to cancel: ' + err);
-            }
-        }
-
-        async function toggleDryRun() {
-            try {
-                // Get current state first
-                const statusResp = await fetch('/api/auto-trader/status');
-                const status = await statusResp.json();
-                const currentDryRun = status.dry_run;
-
-                const resp = await fetch('/api/auto-trader/dry-run', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({enabled: !currentDryRun})
-                });
-                const data = await resp.json();
-                alert(data.message);
-                loadAutoTraderStatus();
-            } catch (err) {
-                alert('Failed to toggle mode: ' + err);
-            }
-        }
-
-        async function resetHalt() {
-            try {
-                const resp = await fetch('/api/auto-trader/reset-halt', {method: 'POST'});
-                const data = await resp.json();
-                if (data.error) {
-                    alert('Failed to reset halt: ' + data.error);
-                    return;
-                }
-                if (data.success) {
-                    console.log('Halt reset successfully. Previous reason:', data.previous_reason);
-                }
-                loadAutoTraderStatus();
-            } catch (err) {
-                alert('Failed to reset: ' + err);
-            }
-        }
-
-        async function saveConfig() {
-            try {
-                const config = {
-                    max_daily_loss_pct: parseFloat(document.getElementById('cfg-daily-loss').value) / 100,
-                    max_drawdown_pct: parseFloat(document.getElementById('cfg-max-drawdown').value) / 100,
-                    max_total_exposure: parseFloat(document.getElementById('cfg-max-exposure').value) / 100,
-                    financial_min_edge: parseFloat(document.getElementById('cfg-fin-min-edge').value) / 100,
-                    financial_position_size: parseInt(document.getElementById('cfg-fin-position-size').value),
-                    max_total_orders: parseInt(document.getElementById('cfg-max-orders').value),
-                };
-                const resp = await fetch('/api/trading-config', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(config)
-                });
-                const data = await resp.json();
-                if (data.error) {
-                    alert('Error: ' + data.error);
-                } else {
-                    alert('Config saved');
-                }
-            } catch (err) {
-                alert('Failed to save: ' + err);
-            }
-        }
-
-        async function loadConfig() {
-            try {
-                const resp = await fetch('/api/trading-config');
-                const data = await resp.json();
-                document.getElementById('cfg-daily-loss').value = (data.max_daily_loss_pct * 100).toFixed(1);
-                document.getElementById('cfg-max-drawdown').value = (data.max_drawdown_pct * 100).toFixed(0);
-                document.getElementById('cfg-max-exposure').value = (data.max_total_exposure * 100).toFixed(0);
-                document.getElementById('cfg-fin-min-edge').value = (data.financial_min_edge * 100).toFixed(1);
-                document.getElementById('cfg-fin-position-size').value = data.financial_position_size;
-                document.getElementById('cfg-max-orders').value = data.max_total_orders || 20;
-            } catch (err) {}
-        }
-
-        // Load trading plan
-        async function loadTradingPlan() {
-            try {
-                const resp = await fetch('/api/trading-plan');
-                const data = await resp.json();
-
-                document.getElementById('plan-order-count').textContent = data.order_count || 0;
-                document.getElementById('plan-capital').textContent = '$' + fmt(data.capital || 0);
-                document.getElementById('plan-ev').textContent = '$' + fmt(data.total_ev || 0);
-
-                const tbody = document.getElementById('trading-table');
-                if (!data.orders || data.orders.length === 0) {
-                    tbody.innerHTML = '<tr><td colspan="7" class="text-muted" style="text-align:center">No orders in plan</td></tr>';
-                    return;
-                }
-
-                tbody.innerHTML = data.orders.map(o => {
-                    const shortTitle = o.title && o.title.length > 45 ? o.title.slice(0, 42) + '...' : (o.title || o.ticker);
-                    return `
-                    <tr title="${o.title || o.ticker}">
-                        <td>
-                            <div style="font-size: 11px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${shortTitle}</div>
-                        </td>
-                        <td><span class="edge positive">${o.side}</span></td>
+            // Active orders with age colors
+            const tb = document.getElementById('active-orders-table');
+            if (!d.orders||!d.orders.length) {
+                tb.innerHTML='<tr><td colspan="6" class="text-muted" style="text-align:center">No active orders</td></tr>';
+            } else {
+                tb.innerHTML = d.orders.map(o => {
+                    const st = o.title&&o.title.length>50?o.title.slice(0,47)+'...':(o.title||o.ticker);
+                    const ag = Math.round(o.age_seconds);
+                    return `<tr title="${esc(o.title||o.ticker)}">
+                        <td><div class="mono" style="font-size:10px;color:var(--text-3);">${esc(o.ticker.substring(0,25))}...</div>
+                            <div style="font-size:11px;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(st)}</div></td>
+                        <td><span class="edge positive">${o.side.toUpperCase()}</span></td>
                         <td class="text-right mono">${o.price}c</td>
                         <td class="text-right">${o.size}</td>
-                        <td class="text-right text-green">${(o.edge * 100).toFixed(1)}%</td>
-                        <td class="text-right">${(o.fill_prob * 100).toFixed(0)}%</td>
-                        <td class="text-right text-green">$${o.ev.toFixed(2)}</td>
-                        <td>
-                            <button class="place-btn" onclick="placeOrder('${o.ticker}', '${o.side}', ${o.price}, ${o.size})">
-                                Place
-                            </button>
-                        </td>
-                    </tr>
-                `}).join('');
-            } catch (err) {
-                console.error('Failed to load trading plan:', err);
+                        <td class="text-right">${(o.fair_value*100).toFixed(1)}%</td>
+                        <td class="text-right ${ageClass(ag)}">${ag}s</td>
+                    </tr>`;
+                }).join('');
             }
-        }
 
-        // Place single order
-        async function placeOrder(ticker, side, price, size) {
-            if (!confirm(`Place order: Buy ${size}x ${side} @ ${price}c?`)) return;
-
-            try {
-                const resp = await fetch('/api/place-order', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ticker, side, price, size})
-                });
-                const data = await resp.json();
-                if (data.error) {
-                    alert('Error: ' + data.error);
+            if (d.fill_stats) {
+                const fs = d.fill_stats;
+                document.getElementById('fill-total').textContent = fs.total_orders||0;
+                document.getElementById('fill-rate').textContent = fs.total_orders>0?(fs.fill_rate*100).toFixed(1)+'%':'--';
+                document.getElementById('fill-time').textContent = fs.avg_time_to_fill>0?Math.round(fs.avg_time_to_fill)+'s':'--';
+                document.getElementById('adverse-selection').textContent = fs.total_orders>0?(fs.avg_adverse_selection*100).toFixed(2)+'%':'--';
+                const sr = fs.fill_rate_by_spread||{};
+                const se = Object.entries(sr).sort((a,b)=>parseInt(a[0])-parseInt(b[0]));
+                const el = document.getElementById('fill-rates-by-spread');
+                if (se.length>0&&fs.total_orders>=10) {
+                    el.innerHTML = '<span style="color:var(--text-3);">Learned rates:</span> '+
+                        se.map(([s,r])=>`Spread &le;${s}c: <strong>${(r*100).toFixed(0)}%</strong>`).join(' | ');
                 } else {
-                    alert('Order placed!');
-                    loadTradingPlan();
-                }
-            } catch (err) {
-                alert('Failed to place order: ' + err);
-            }
-        }
-
-        // Place all orders
-        async function placeAllOrders() {
-            if (!confirm('Place ALL orders in the trading plan? This will submit multiple limit orders.')) return;
-
-            const btn = document.querySelector('.place-all-btn');
-            btn.disabled = true;
-            btn.textContent = 'Placing...';
-
-            try {
-                const resp = await fetch('/api/place-all-orders', {method: 'POST'});
-                const data = await resp.json();
-                if (data.error) {
-                    alert('Error: ' + data.error);
-                } else {
-                    alert(`Placed ${data.placed} orders, ${data.failed} failed`);
-                    loadTradingPlan();
-                    loadData();  // Refresh positions
-                }
-            } catch (err) {
-                alert('Failed to place orders: ' + err);
-            }
-
-            btn.disabled = false;
-            btn.textContent = 'Place All Orders';
-        }
-
-        // Track data freshness
-        let lastDataTime = Date.now();
-
-        // Fetch and render data
-        async function loadData() {
-            try {
-                const resp = await fetch('/api/data');
-                const data = await resp.json();
-                lastDataTime = Date.now();
-
-                // Update stats
-                document.getElementById('balance').textContent = '$' + fmt(data.balance);
-                document.getElementById('position-count').textContent = data.positions.length;
-
-                // Calculate total unrealized P&L
-                const totalPnl = data.positions.reduce((sum, p) => sum + (p.unrealized_pnl || 0), 0);
-                const pnlEl = document.getElementById('unrealized-pnl');
-                pnlEl.textContent = '$' + fmt(totalPnl);
-                pnlEl.className = 'stat-value ' + (totalPnl >= 0 ? 'positive' : 'negative');
-
-                // Find best edge across all markets
-                let bestEdge = 0;
-                let bestSide = '';
-                [
-                    ...(data.nasdaq?.above || []),
-                    ...(data.nasdaq?.range || []),
-                    ...(data.spx?.above || []),
-                    ...(data.spx?.range || [])
-                ].forEach(m => {
-                    if (m.best_edge && m.best_edge > bestEdge) {
-                        bestEdge = m.best_edge;
-                        bestSide = m.best_side;
-                    }
-                });
-                const bestEdgeEl = document.getElementById('best-edge');
-                if (bestEdge >= 0.01) {
-                    bestEdgeEl.textContent = bestSide + ' +' + (bestEdge * 100).toFixed(1) + '%';
-                    bestEdgeEl.className = 'stat-value positive';
-                } else {
-                    bestEdgeEl.textContent = '-';
-                    bestEdgeEl.className = 'stat-value';
-                }
-
-                // Render positions
-                renderPositions(data.positions);
-
-                // Render NASDAQ futures prices
-                if (data.nasdaq?.futures?.price) {
-                    ['nq-price-1', 'nq-price-2'].forEach(id => {
-                        document.getElementById(id).textContent = fmt(data.nasdaq.futures.price, 2);
-                    });
-                    const change = data.nasdaq.futures.change_pct || 0;
-                    ['nq-change-1', 'nq-change-2'].forEach(id => {
-                        const el = document.getElementById(id);
-                        el.textContent = (change >= 0 ? '+' : '') + change.toFixed(2) + '%';
-                        el.className = 'change ' + (change >= 0 ? 'text-green' : 'text-red');
-                    });
-                }
-                renderMarkets(data.nasdaq?.above, 'nasdaq-above-table', data.nasdaq?.futures?.price);
-                renderMarkets(data.nasdaq?.range, 'nasdaq-range-table', data.nasdaq?.futures?.price);
-
-                // Render S&P futures prices
-                if (data.spx?.futures?.price) {
-                    ['es-price-1', 'es-price-2'].forEach(id => {
-                        document.getElementById(id).textContent = fmt(data.spx.futures.price, 2);
-                    });
-                    const change = data.spx.futures.change_pct || 0;
-                    ['es-change-1', 'es-change-2'].forEach(id => {
-                        const el = document.getElementById(id);
-                        el.textContent = (change >= 0 ? '+' : '') + change.toFixed(2) + '%';
-                        el.className = 'change ' + (change >= 0 ? 'text-green' : 'text-red');
-                    });
-                }
-                renderMarkets(data.spx?.above, 'spx-above-table', data.spx?.futures?.price);
-                renderMarkets(data.spx?.range, 'spx-range-table', data.spx?.futures?.price);
-
-                // Render Treasury 10Y
-                if (data.treasury10y?.quote?.yield) {
-                    const yieldEl = document.getElementById('t10y-yield');
-                    yieldEl.textContent = data.treasury10y.quote.yield.toFixed(3) + '%';
-                    const change = data.treasury10y.quote.change || 0;
-                    const changeEl = document.getElementById('t10y-change');
-                    changeEl.textContent = (change >= 0 ? '+' : '') + change.toFixed(3) + '%';
-                    changeEl.className = 'change ' + (change >= 0 ? 'text-red' : 'text-green');  // Inverted for yields
-                }
-                renderMarkets(data.treasury10y?.markets, 'treasury-table', data.treasury10y?.quote?.yield, true);
-
-                // Render USD/JPY
-                if (data.usdjpy?.quote?.price) {
-                    const priceEl = document.getElementById('usdjpy-price');
-                    priceEl.textContent = data.usdjpy.quote.price.toFixed(3);
-                    const change = data.usdjpy.quote.change || 0;
-                    const changeEl = document.getElementById('usdjpy-change');
-                    changeEl.textContent = (change >= 0 ? '+' : '') + change.toFixed(3);
-                    changeEl.className = 'change ' + (change >= 0 ? 'text-green' : 'text-red');
-                }
-                renderMarkets(data.usdjpy?.markets, 'usdjpy-table', data.usdjpy?.quote?.price);
-
-                // Render EUR/USD
-                if (data.eurusd?.quote?.price) {
-                    const priceEl = document.getElementById('eurusd-price');
-                    priceEl.textContent = data.eurusd.quote.price.toFixed(5);
-                    const change = data.eurusd.quote.change || 0;
-                    const changeEl = document.getElementById('eurusd-change');
-                    changeEl.textContent = (change >= 0 ? '+' : '') + change.toFixed(5);
-                    changeEl.className = 'change ' + (change >= 0 ? 'text-green' : 'text-red');
-                }
-                renderMarkets(data.eurusd?.markets, 'eurusd-table', data.eurusd?.quote?.price);
-
-                // Render WTI Crude Oil
-                if (data.wti?.quote?.price) {
-                    const priceEl = document.getElementById('wti-price');
-                    priceEl.textContent = '$' + data.wti.quote.price.toFixed(2);
-                    const change = data.wti.quote.change || 0;
-                    const changeEl = document.getElementById('wti-change');
-                    changeEl.textContent = (change >= 0 ? '+' : '') + change.toFixed(2);
-                    changeEl.className = 'change ' + (change >= 0 ? 'text-green' : 'text-red');
-                }
-                renderMarkets(data.wti?.markets, 'wti-table', data.wti?.quote?.price);
-
-                // Render Crypto coins
-                const cryptoCoins = [
-                    {key: 'bitcoin', decimals: 2},
-                    {key: 'ethereum', decimals: 2},
-                    {key: 'solana', decimals: 2},
-                    {key: 'dogecoin', decimals: 4},
-                    {key: 'xrp', decimals: 4},
-                ];
-                for (const coin of cryptoCoins) {
-                    const d = data[coin.key];
-                    if (d?.quote?.price) {
-                        const priceEl = document.getElementById(coin.key + '-price');
-                        priceEl.textContent = '$' + d.quote.price.toLocaleString('en-US', {minimumFractionDigits: coin.decimals, maximumFractionDigits: coin.decimals});
-                        const change = d.quote.change || 0;
-                        const changeEl = document.getElementById(coin.key + '-change');
-                        changeEl.textContent = (change >= 0 ? '+' : '') + change.toFixed(coin.decimals);
-                        changeEl.className = 'change ' + (change >= 0 ? 'text-green' : 'text-red');
-                    }
-                    renderMarkets(d?.markets, coin.key + '-table', d?.quote?.price);
-                }
-
-            } catch (err) {
-                console.error('Failed to load data:', err);
-            }
-        }
-
-        // Initial load and fast refresh
-        loadData();
-        loadTradingPlan();
-        loadAutoTraderStatus();
-        loadConfig();
-        setInterval(loadData, 1000);  // Market data every 1 second
-        setInterval(loadTradingPlan, 5000);  // Trading plan every 5 seconds
-        setInterval(loadAutoTraderStatus, 2000);  // Auto-trader status every 2 seconds
-
-        // Show data freshness indicator
-        function updateFreshness() {
-            const age = Math.floor((Date.now() - lastDataTime) / 1000);
-            const el = document.getElementById('data-age');
-            if (el) {
-                if (age < 3) {
-                    el.textContent = 'LIVE';
-                    el.className = 'data-age live';
-                } else {
-                    el.textContent = age + 's ago';
-                    el.className = 'data-age stale';
+                    el.innerHTML = '<span style="color:var(--text-3);">Need 10+ orders for learned rates</span>';
                 }
             }
-        }
-        setInterval(updateFreshness, 500);
+        } catch(e) { console.error('Failed to load auto-trader status:',e); }
+    }
 
+    async function startAutoTrading() {
+        try { await fetch('/api/auto-trader/start',{method:'POST'}); loadAutoTraderStatus(); }
+        catch(e) { alert('Failed to start: '+e); }
+    }
+    async function stopAutoTrading() {
+        try { await fetch('/api/auto-trader/stop',{method:'POST'}); loadAutoTraderStatus(); }
+        catch(e) { alert('Failed to stop: '+e); }
+    }
+    async function cancelAllOrders() {
+        try {
+            const r = await fetch('/api/auto-trader/cancel-all',{method:'POST'});
+            const d = await r.json(); alert('Cancelled '+d.cancelled+' orders'); loadAutoTraderStatus();
+        } catch(e) { alert('Failed to cancel: '+e); }
+    }
+    async function toggleDryRun() {
+        try {
+            const sr = await fetch('/api/auto-trader/status'); const st = await sr.json();
+            if (st.dry_run && !confirm('You are switching to LIVE mode. Real orders will be placed.')) return;
+            const r = await fetch('/api/auto-trader/dry-run',{
+                method:'POST',headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({enabled:!st.dry_run})
+            });
+            const d = await r.json(); alert(d.message); loadAutoTraderStatus();
+        } catch(e) { alert('Failed to toggle mode: '+e); }
+    }
+    async function resetHalt() {
+        try {
+            const r = await fetch('/api/auto-trader/reset-halt',{method:'POST'});
+            const d = await r.json();
+            if (d.error) { alert('Failed: '+d.error); return; }
+            loadAutoTraderStatus();
+        } catch(e) { alert('Failed to reset: '+e); }
+    }
+
+    // ---- CONFIG ----
+    async function saveConfig() {
+        try {
+            const cfg = {
+                max_daily_loss_pct: parseFloat(document.getElementById('cfg-daily-loss').value)/100,
+                max_drawdown_pct: parseFloat(document.getElementById('cfg-max-drawdown').value)/100,
+                max_total_exposure: parseFloat(document.getElementById('cfg-max-exposure').value)/100,
+                financial_min_edge: parseFloat(document.getElementById('cfg-fin-min-edge').value)/100,
+                financial_position_size: parseInt(document.getElementById('cfg-fin-position-size').value),
+                max_total_orders: parseInt(document.getElementById('cfg-max-orders').value),
+            };
+            const r = await fetch('/api/trading-config',{
+                method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)
+            });
+            const d = await r.json();
+            if (d.error) alert('Error: '+d.error);
+            else { alert('Config saved'); cachedConfig = cfg; }
+        } catch(e) { alert('Failed to save: '+e); }
+    }
+    async function loadConfig() {
+        try {
+            const r = await fetch('/api/trading-config');
+            cachedConfig = await r.json();
+            document.getElementById('cfg-daily-loss').value = (cachedConfig.max_daily_loss_pct*100).toFixed(1);
+            document.getElementById('cfg-max-drawdown').value = (cachedConfig.max_drawdown_pct*100).toFixed(0);
+            document.getElementById('cfg-max-exposure').value = (cachedConfig.max_total_exposure*100).toFixed(0);
+            document.getElementById('cfg-fin-min-edge').value = (cachedConfig.financial_min_edge*100).toFixed(1);
+            document.getElementById('cfg-fin-position-size').value = cachedConfig.financial_position_size;
+            document.getElementById('cfg-max-orders').value = cachedConfig.max_total_orders||20;
+        } catch(e) {}
+    }
+
+    // ---- MAIN DATA LOAD ----
+    async function loadData() {
+        try {
+            const r = await fetch('/api/data');
+            const data = await r.json();
+            lastDataTime = Date.now();
+
+            const allMarkets = [];
+            for (const [ak,sk,sl] of ASSET_MAP) {
+                const d = data[ak]; if (!d) continue;
+                for (const m of (d[sk]||[])) allMarkets.push({...m, asset: sl});
+            }
+            renderOpportunities(allMarkets);
+            renderPositions(data.positions);
+            renderAccordions(data);
+        } catch(e) { console.error('Failed to load data:',e); }
+    }
+
+    // ---- FRESHNESS ----
+    function updateFreshness() {
+        const age = Math.floor((Date.now()-lastDataTime)/1000);
+        const el = document.getElementById('data-age');
+        if (el) {
+            if (age < 3) { el.textContent='LIVE'; el.className='data-age live'; }
+            else { el.textContent=age+'s ago'; el.className='data-age stale'; }
+        }
+    }
+
+    // ---- VISIBILITY API ----
+    function startPolling() {
+        if (!dataIntervalId) dataIntervalId = setInterval(loadData, 1000);
+        if (!statusIntervalId) statusIntervalId = setInterval(loadAutoTraderStatus, 2000);
+        if (!freshnessIntervalId) freshnessIntervalId = setInterval(updateFreshness, 500);
+    }
+    function stopPolling() {
+        if (dataIntervalId) { clearInterval(dataIntervalId); dataIntervalId=null; }
+        if (statusIntervalId) { clearInterval(statusIntervalId); statusIntervalId=null; }
+        if (freshnessIntervalId) { clearInterval(freshnessIntervalId); freshnessIntervalId=null; }
+    }
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) stopPolling();
+        else { loadData(); loadAutoTraderStatus(); startPolling(); }
+    });
+
+    // ---- INIT ----
+    loadData();
+    loadAutoTraderStatus();
+    loadConfig();
+    startPolling();
     </script>
 </body>
 </html>

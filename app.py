@@ -62,7 +62,38 @@ def main():
     """)
 
     app = create_app()
-    app.run(host='0.0.0.0', port=port, debug=False)
+
+    # Use gunicorn in production if available, fall back to Flask dev server
+    try:
+        import gunicorn  # noqa: F401
+        from gunicorn.app.base import BaseApplication
+
+        class StandaloneApplication(BaseApplication):
+            def __init__(self, app, options=None):
+                self.options = options or {}
+                self.application = app
+                super().__init__()
+
+            def load_config(self):
+                for key, value in self.options.items():
+                    if key in self.cfg.settings and value is not None:
+                        self.cfg.set(key.lower(), value)
+
+            def load(self):
+                return self.application
+
+        options = {
+            'bind': f'0.0.0.0:{port}',
+            'workers': 1,          # Single worker (background threads share state)
+            'threads': 4,          # Handle concurrent dashboard requests
+            'timeout': 120,        # Long timeout for slow API calls
+            'preload_app': True,
+        }
+        print("[STARTUP] Using gunicorn production server")
+        StandaloneApplication(app, options).run()
+    except ImportError:
+        print("[STARTUP] gunicorn not installed, using Flask dev server (not for production)")
+        app.run(host='0.0.0.0', port=port, debug=False)
 
 
 if __name__ == '__main__':
