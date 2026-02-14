@@ -247,8 +247,8 @@ def create_app():
             traceback.print_exc()
             return False
 
-    def update_data():
-        """Update all market data"""
+    def update_data(heartbeat: dict = None):
+        """Update all market data. heartbeat dict is updated periodically to prevent dead-thread alarms."""
         if not state["client"]:
             if not connect():
                 return
@@ -426,6 +426,10 @@ def create_app():
                 with state_lock:
                     state["markets"]["spx_above"] = sorted(above_markets, key=lambda x: x.lower_bound or 0)
 
+            # Keep heartbeat alive during long update cycles
+            if heartbeat:
+                heartbeat["background_updater"] = time.time()
+
             # Update Treasury 10Y markets (KXTNOTED)
             try:
                 # Always fetch markets from Kalshi, regardless of quote availability
@@ -502,6 +506,9 @@ def create_app():
                 print(f"[MARKETS] Error fetching Treasury: {e}")
                 import traceback
                 traceback.print_exc()
+
+            if heartbeat:
+                heartbeat["background_updater"] = time.time()
 
             # Update USD/JPY markets (KXUSDJPY)
             try:
@@ -693,7 +700,12 @@ def create_app():
             except Exception as e:
                 print(f"[MARKETS] Error fetching WTI: {e}")
 
+            if heartbeat:
+                heartbeat["background_updater"] = time.time()
+
             # Update Crypto markets (BTC, ETH, SOL, DOGE, XRP — each with 15min, hourly, daily)
+            # Only keep markets expiring within MAX_CRYPTO_HOURS to avoid processing 8000+ markets
+            MAX_CRYPTO_HOURS = 8  # Only track markets expiring within 8 hours
             CRYPTO_COINS = {
                 "bitcoin": {"series": ["KXBTC", "KXBTC15M", "KXBTCD"], "label": "BTC"},
                 "ethereum": {"series": ["KXETH", "KXETH15M", "KXETHD"], "label": "ETH"},
@@ -716,7 +728,7 @@ def create_app():
                         raw = state["client"].get_markets_by_series_prefix(series, status="open")
                         for m in (raw or []):
                             hours = hours_until(m.close_time)
-                            if hours and hours > 0:
+                            if hours and hours > 0 and hours <= MAX_CRYPTO_HOURS:
                                 if coin_price:
                                     if m.lower_bound is not None and m.upper_bound is not None:
                                         fv_result = fv_model.calculate(
@@ -759,6 +771,10 @@ def create_app():
                         print(f"[MARKETS] Loaded {len(coin_markets)} {coin_info['label']} markets{price_str}")
                 except Exception as e:
                     print(f"[MARKETS] Error fetching {coin_info['label']}: {e}")
+
+                # Keep heartbeat alive between crypto coins (each coin = 3 API calls)
+                if heartbeat:
+                    heartbeat["background_updater"] = time.time()
 
             # Update position prices
             for pos in state["positions"]:
@@ -872,7 +888,7 @@ def create_app():
         """Background thread for full data refresh (positions, new markets)"""
         while True:
             try:
-                update_data()
+                update_data(heartbeat=state["thread_heartbeats"])
             except Exception as e:
                 print(f"[THREAD] background_updater error: {e}")
             state["thread_heartbeats"]["background_updater"] = time.time()
@@ -1183,23 +1199,40 @@ def create_app():
                     if btc and btc.price > 1000:  # BTC should be ~$90000+
                         futures_ok = True
 
-                    # Check thread heartbeats — halt if critical threads are dead
-                    # All data-producing threads are critical: if any dies, we trade on stale data
+                    # Check thread heartbeats — skip trading if critical threads are stale.
+                    # Use soft-skip (not permanent halt) so trading auto-resumes when threads recover.
+                    # Permanent halts are reserved for financial safety (loss limits, drawdown).
                     critical_threads = {
                         "fast_futures_updater": 30,    # Updates every 5s, stale after 30s
                         "fast_market_updater": 15,     # Updates every 0.5s, stale after 15s
-                        "background_updater": 120,     # Updates every 30s, stale after 120s
+                        "background_updater": 300,     # Updates mid-cycle via heartbeat, stale after 5min
                         "orderbook_updater": 30,       # Updates every 1s, stale after 30s
                     }
                     now_ts = time.time()
+                    threads_ok = True
                     for thread_name, max_age in critical_threads.items():
                         last_hb = state["thread_heartbeats"].get(thread_name)
                         if last_hb and (now_ts - last_hb) > max_age:
-                            print(f"[AUTO-TRADE] HALTING: {thread_name} heartbeat stale ({now_ts - last_hb:.0f}s > {max_age}s)")
-                            state["auto_trader"]._halt(f"Thread {thread_name} dead (>{now_ts - last_hb:.0f}s)")
+                            stale_age = now_ts - last_hb
+                            # Log once per minute to avoid spam
+                            if not hasattr(auto_trading_loop, '_last_thread_warn') or \
+                               now_ts - auto_trading_loop._last_thread_warn > 60:
+                                print(f"[AUTO-TRADE] Skipping: {thread_name} heartbeat stale ({stale_age:.0f}s > {max_age}s)")
+                                auto_trading_loop._last_thread_warn = now_ts
+                            threads_ok = False
                             break
 
-                    if all_markets and futures_ok:
+                    if all_markets and futures_ok and threads_ok:
+                        # Auto-recover from thread-death halts now that threads are healthy.
+                        # Only recover from "Thread X dead" halts — financial halts (loss limits,
+                        # drawdown, errors) require manual reset via dashboard.
+                        trader = state["auto_trader"]
+                        if trader._halted and "Thread" in (trader._halt_reason or "") and "dead" in (trader._halt_reason or ""):
+                            print(f"[AUTO-TRADE] Threads recovered — auto-resuming from: {trader._halt_reason}")
+                            trader._halted = False
+                            trader._halt_reason = ""
+                            trader._error_history.clear()
+
                         # Pass VIX price for dynamic order scaling
                         if state.get("vix_price"):
                             state["auto_trader"]._vix_price = state["vix_price"]
