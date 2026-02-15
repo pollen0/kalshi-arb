@@ -112,22 +112,30 @@ class MarketDiscovery:
         "KXBTC": AssetClass.CRYPTO,
         "KXBTC15M": AssetClass.CRYPTO,
         "KXBTCD": AssetClass.CRYPTO,
+        "KXBTCMAXW": AssetClass.CRYPTO,
+        "KXBTCMAXMON": AssetClass.CRYPTO,
+        "KXBTCMINMON": AssetClass.CRYPTO,
         # Crypto — ETH
         "KXETH": AssetClass.CRYPTO,
         "KXETH15M": AssetClass.CRYPTO,
         "KXETHD": AssetClass.CRYPTO,
-        # Crypto — SOL
-        "KXSOL": AssetClass.CRYPTO,
+        "KXETHMAXMON": AssetClass.CRYPTO,
+        "KXETHMINMON": AssetClass.CRYPTO,
+        # Crypto — SOL (range markets are KXSOLE, not KXSOL)
+        "KXSOLE": AssetClass.CRYPTO,
         "KXSOL15M": AssetClass.CRYPTO,
         "KXSOLD": AssetClass.CRYPTO,
-        # Crypto — DOGE
+        "KXSOLMAXMON": AssetClass.CRYPTO,
+        # Crypto — DOGE (no 15M series exists)
         "KXDOGE": AssetClass.CRYPTO,
-        "KXDOGE15M": AssetClass.CRYPTO,
         "KXDOGED": AssetClass.CRYPTO,
+        "KXDOGEMAXW": AssetClass.CRYPTO,
+        "KXDOGEMAXMON": AssetClass.CRYPTO,
         # Crypto — XRP
         "KXXRP": AssetClass.CRYPTO,
         "KXXRP15M": AssetClass.CRYPTO,
         "KXXRPD": AssetClass.CRYPTO,
+        "KXXRPMAXMON": AssetClass.CRYPTO,
     }
 
     # Expiration times in EST (approximate)

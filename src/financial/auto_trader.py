@@ -468,13 +468,23 @@ class AutoTrader:
         equity = self.get_portfolio_value()
         balance = self._last_known_balance or 0
 
-        # Initialize starting equity on first check (or new day)
+        # Cost-basis equity: cash + sum(qty * avg_price).
+        # Used for daily loss check because MTM swings in healthy positions
+        # can cause false halts. Cost-basis only changes on actual fills/settlements.
+        cost_basis_equity = balance
+        with self._lock:
+            for pos in self.positions.values():
+                if pos.quantity > 0:
+                    cost_basis_equity += pos.quantity * pos.avg_price
+
+        # Initialize starting equity on first check (or new day).
+        # Use COST-BASIS equity so it's consistent with the daily loss check below.
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self._starting_balance is None or self._starting_date != today:
-            self._starting_balance = equity
+            self._starting_balance = cost_basis_equity
             self._starting_date = today
             self._save_daily_state()
-            print(f"[SAFETY] Starting equity for {today}: ${equity:.2f} (cash: ${balance:.2f})")
+            print(f"[SAFETY] Starting equity for {today}: ${cost_basis_equity:.2f} (cash: ${balance:.2f}, MTM: ${equity:.2f})")
 
         # Check minimum balance using EQUITY (cash + positions), not just cash.
         # Cash alone can be low when capital is deployed in positions/orders.
@@ -482,15 +492,7 @@ class AutoTrader:
             self._halt("Total equity too low: ${:.2f}".format(equity))
             return False, self._halt_reason
 
-        # Check daily loss limit based on COST-BASIS EQUITY (cash + position cost basis)
-        # Using MTM equity causes false halts because unrealized price swings
-        # in healthy positions trigger the loss limit. Cost-basis equity only
-        # changes on actual fills/settlements, so only real losses trigger halts.
-        cost_basis_equity = balance
-        with self._lock:
-            for pos in self.positions.values():
-                if pos.quantity > 0:
-                    cost_basis_equity += pos.quantity * pos.avg_price
+        # Check daily loss limit against cost-basis equity
         if self._starting_balance > 0:
             daily_pnl_pct = (cost_basis_equity - self._starting_balance) / self._starting_balance
             if daily_pnl_pct < -self.config.max_daily_loss_pct:
@@ -617,18 +619,26 @@ class AutoTrader:
         self._halt_reason = ""
         self._error_history.clear()
 
-        # Also reset daily tracking so we don't immediately halt again
-        self._starting_balance = self.get_portfolio_value()
-        self._peak_equity = self._starting_balance  # Reset peak so drawdown starts fresh
+        # Reset daily tracking using COST-BASIS equity (cash + sum(qty * avg_price))
+        # to match what check_safety() uses for the daily loss check.
+        # Using MTM equity here caused immediate re-halts when MTM > cost-basis.
+        balance = self.client.get_balance() or self._last_known_balance or 0
+        cost_basis_equity = balance
+        with self._lock:
+            for pos in self.positions.values():
+                if pos.quantity > 0:
+                    cost_basis_equity += pos.quantity * pos.avg_price
+        self._starting_balance = cost_basis_equity
+        self._starting_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self._peak_equity = self.get_portfolio_value()  # Peak uses MTM for drawdown check
         self._save_daily_state()
 
         print(f"\n[{timestamp}] HALT STATE RESET")
         print(f"    Previous halt reason: {prev_reason}")
         print(f"    Previous starting equity: ${old_starting:.2f}" if old_starting else "    Previous: None")
-        print(f"    New starting equity: ${self._starting_balance:.2f}")
-        print(f"    Peak equity reset to: ${self._peak_equity:.2f}")
-        print(f"    Current balance: ${self.client.get_balance() or 0:.2f}")
-        print(f"    Current equity: ${self.get_portfolio_value():.2f}")
+        print(f"    New starting equity (cost-basis): ${self._starting_balance:.2f}")
+        print(f"    Peak equity (MTM): ${self._peak_equity:.2f}")
+        print(f"    Cash balance: ${balance:.2f}")
         print(f"    Error history cleared")
 
     def reset_daily_tracking(self):
@@ -636,12 +646,19 @@ class AutoTrader:
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         old_starting = self._starting_balance
 
-        self._starting_balance = self.get_portfolio_value()  # Use equity, not just cash
+        # Use cost-basis equity to match check_safety() daily loss calculation
+        balance = self.client.get_balance() or self._last_known_balance or 0
+        cost_basis_equity = balance
+        with self._lock:
+            for pos in self.positions.values():
+                if pos.quantity > 0:
+                    cost_basis_equity += pos.quantity * pos.avg_price
+        self._starting_balance = cost_basis_equity
         self._error_history.clear()
 
         print(f"\n[{timestamp}] DAILY TRACKING RESET")
         print(f"    Previous starting equity: ${old_starting:.2f}" if old_starting else "    Previous: None")
-        print(f"    New starting equity: ${self._starting_balance:.2f}")
+        print(f"    New starting equity (cost-basis): ${self._starting_balance:.2f}")
 
     def _classify_error(self, error: Exception, context: str = "") -> ErrorType:
         """Classify an exception into an error type"""
@@ -906,8 +923,24 @@ class AutoTrader:
         # When positive (favorable), we don't reduce required edge (be conservative)
         adverse_selection_penalty = max(0, -avg_adverse)  # Convert negative to positive penalty
 
-        # Base required edge (from config)
+        # Base required edge — scale up for high-vol asset classes
+        # Flat 2% is fine for equities (16-22% vol) but way too tight for
+        # crypto (55-90% vol). Scale: min_edge * (asset_vol / equity_baseline_vol)
+        # so crypto with 70% vol gets ~6% min edge instead of 2%.
         base_edge = self.config.min_edge
+        asset_class = self.risk_manager.get_asset_class(market.ticker)
+        ASSET_CLASS_EDGE_MULTIPLIER = {
+            "nasdaq": 1.0, "spx": 1.0, "dow": 1.0, "russell": 1.0,  # equities baseline
+            "treasury": 1.0,
+            "usdjpy": 1.0, "eurusd": 1.0,  # forex is low vol, 2% is fine
+            "wti": 1.5,                      # oil is volatile
+            "bitcoin": 2.5,                  # ~55% vol → 5% min edge
+            "ethereum": 3.0,                 # ~70% vol → 6% min edge
+            "solana": 3.5,                   # ~80% vol → 7% min edge
+            "dogecoin": 4.0,                 # ~90% vol → 8% min edge
+            "xrp": 3.5,                      # ~75% vol → 7% min edge
+        }
+        base_edge *= ASSET_CLASS_EDGE_MULTIPLIER.get(asset_class, 1.0)
 
         # Additional edge for low fill probability
         # If fill prob = 1.0, no adjustment
@@ -950,6 +983,18 @@ class AutoTrader:
         yes_ask = market.yes_ask or 100
         spread = yes_ask - yes_bid
 
+        # Asset-class-aware MM edge buffer: crypto needs wider buffer than equities
+        asset_class = self.risk_manager.get_asset_class(market.ticker)
+        MM_EDGE_BUFFER_BY_CLASS = {
+            "bitcoin": 0.25,   # 25% buffer (was 12%)
+            "ethereum": 0.30,  # 30% buffer
+            "solana": 0.35,    # 35% buffer
+            "dogecoin": 0.40,  # 40% buffer
+            "xrp": 0.35,       # 35% buffer
+            "wti": 0.18,       # 18% buffer (oil is volatile)
+        }
+        mm_edge_buffer = MM_EDGE_BUFFER_BY_CLASS.get(asset_class, self.config.market_making_edge_buffer)
+
         # Check if we should use market making mode (wide spread liquidity provision)
         # Require minimum volume to avoid adverse selection in dead books
         # (informed traders will pick off stale MM quotes in zero-volume markets)
@@ -980,11 +1025,11 @@ class AutoTrader:
                 # For liquid-ish markets, cap at 6c to stay competitive
                 if spread >= 50:
                     # No liquidity — use percentage-based pricing only
-                    edge_target = int(fair_cents * (1 - self.config.market_making_edge_buffer))
+                    edge_target = int(fair_cents * (1 - mm_edge_buffer))
                 else:
                     edge_target = max(
                         fair_cents - self.config.market_making_edge_cents,
-                        int(fair_cents * (1 - self.config.market_making_edge_buffer)),
+                        int(fair_cents * (1 - mm_edge_buffer)),
                     )
                 # Then ensure we at least beat the existing bid for queue priority
                 mm_bid = max(
@@ -1079,11 +1124,11 @@ class AutoTrader:
                 # Calculate market making bid for NO side
                 if spread >= 50:
                     # No liquidity — use percentage-based pricing only
-                    edge_target = int(fair_cents * (1 - self.config.market_making_edge_buffer))
+                    edge_target = int(fair_cents * (1 - mm_edge_buffer))
                 else:
                     edge_target = max(
                         fair_cents - self.config.market_making_edge_cents,
-                        int(fair_cents * (1 - self.config.market_making_edge_buffer)),
+                        int(fair_cents * (1 - mm_edge_buffer)),
                     )
                 # Then ensure we at least beat the existing bid for queue priority
                 mm_bid = max(

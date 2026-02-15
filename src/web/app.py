@@ -707,11 +707,11 @@ def create_app():
             # Only keep markets expiring within MAX_CRYPTO_HOURS to avoid processing 8000+ markets
             MAX_CRYPTO_HOURS = 48  # Track up to 2 days (matches days_ahead=2)
             CRYPTO_COINS = {
-                "bitcoin": {"series": ["KXBTC", "KXBTC15M", "KXBTCD"], "label": "BTC"},
-                "ethereum": {"series": ["KXETH", "KXETH15M", "KXETHD"], "label": "ETH"},
-                "solana": {"series": ["KXSOL", "KXSOL15M", "KXSOLD"], "label": "SOL"},
-                "dogecoin": {"series": ["KXDOGE", "KXDOGE15M", "KXDOGED"], "label": "DOGE"},
-                "xrp": {"series": ["KXXRP", "KXXRP15M", "KXXRPD"], "label": "XRP"},
+                "bitcoin": {"series": ["KXBTC", "KXBTC15M", "KXBTCD", "KXBTCMAXW", "KXBTCMAXMON", "KXBTCMINMON"], "label": "BTC"},
+                "ethereum": {"series": ["KXETH", "KXETH15M", "KXETHD", "KXETHMAXMON", "KXETHMINMON"], "label": "ETH"},
+                "solana": {"series": ["KXSOLE", "KXSOL15M", "KXSOLD", "KXSOLMAXMON"], "label": "SOL"},
+                "dogecoin": {"series": ["KXDOGE", "KXDOGED", "KXDOGEMAXW", "KXDOGEMAXMON"], "label": "DOGE"},
+                "xrp": {"series": ["KXXRP", "KXXRP15M", "KXXRPD", "KXXRPMAXMON"], "label": "XRP"},
             }
             for coin_key, coin_info in CRYPTO_COINS.items():
                 try:
@@ -907,8 +907,14 @@ def create_app():
     def fast_futures_updater():
         """Background thread for futures prices - every 5 seconds (rate-limited)"""
         # Cache volatility (recalculate every 5 minutes)
-        cached_vol = {"nasdaq": 0.20, "spx": 0.16}
-        last_vol_update = datetime.now(timezone.utc)
+        cached_vol = {
+            "nasdaq": 0.22, "spx": 0.16,
+            "bitcoin": 0.55, "ethereum": 0.70, "solana": 0.80,
+            "dogecoin": 0.90, "xrp": 0.75,
+            "usdjpy": 0.08, "eurusd": 0.08, "wti": 0.35,
+            "treasury10y": 0.15,
+        }
+        last_vol_update = datetime.min.replace(tzinfo=timezone.utc)  # Force immediate vol fetch on startup
         last_options_update = datetime.now(timezone.utc)
 
         while True:
@@ -962,8 +968,39 @@ def create_app():
                             cached_vol["spx"] = es_vol
                             if fv_model:
                                 fv_model.historical_vols["spx"] = es_vol
+
+                        # Crypto historical vol (was missing — always fell back to stale defaults)
+                        crypto_vol_bounds = {
+                            "bitcoin":  (0.20, 1.50),   # BTC: 20-150% annualized
+                            "ethereum": (0.25, 2.00),   # ETH: 25-200%
+                            "solana":   (0.30, 2.50),   # SOL: 30-250%
+                            "dogecoin": (0.30, 3.00),   # DOGE: 30-300%
+                            "xrp":      (0.25, 2.50),   # XRP: 25-250%
+                        }
+                        for coin, (vol_min, vol_max) in crypto_vol_bounds.items():
+                            coin_vol = state["futures"].get_historical_volatility(coin, 20)
+                            if coin_vol and vol_min < coin_vol < vol_max:
+                                cached_vol[coin] = coin_vol
+                                if fv_model:
+                                    fv_model.historical_vols[coin] = coin_vol
+
+                        # Forex & commodity historical vol (also missing)
+                        other_vol_bounds = {
+                            "usdjpy":      (0.03, 0.25),  # FX: 3-25%
+                            "eurusd":      (0.03, 0.25),
+                            "wti":         (0.15, 0.80),  # Oil: 15-80%
+                            "treasury10y": (0.05, 0.40),  # Rates: 5-40%
+                        }
+                        for asset, (vol_min, vol_max) in other_vol_bounds.items():
+                            asset_vol = state["futures"].get_historical_volatility(asset, 20)
+                            if asset_vol and vol_min < asset_vol < vol_max:
+                                cached_vol[asset] = asset_vol
+                                if fv_model:
+                                    fv_model.historical_vols[asset] = asset_vol
+
                         last_vol_update = now
-                        print(f"[FUTURES] Updated historical vol: NDX={cached_vol['nasdaq']*100:.1f}%, SPX={cached_vol['spx']*100:.1f}%")
+                        vol_strs = [f"{k}={v*100:.1f}%" for k, v in sorted(cached_vol.items())]
+                        print(f"[FUTURES] Updated historical vol: {', '.join(vol_strs)}")
                     except Exception as e:
                         print(f"[FUTURES] Error updating historical vol: {e}")
 
