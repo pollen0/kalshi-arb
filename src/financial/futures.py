@@ -548,6 +548,51 @@ class FuturesClient:
         return None
 
     # ========================================================================
+    # Binance Orderbook Imbalance (cross-market signal for crypto)
+    # ========================================================================
+
+    def get_binance_obi(self, depth_limit: int = 20) -> dict[str, float]:
+        """
+        Fetch Binance L2 orderbook depth for all crypto assets and compute
+        Order Book Imbalance (OBI) for each.
+
+        OBI = (sum_bid_qty - sum_ask_qty) / (sum_bid_qty + sum_ask_qty)
+        Range: -1.0 (all asks, bearish) to +1.0 (all bids, bullish)
+
+        Returns: dict mapping coin key (e.g., "bitcoin") to OBI float.
+        """
+        results = {}
+        for coin_key, symbol in self.BINANCE_TICKERS.items():
+            try:
+                resp = self._session.get(
+                    f"https://api.binance.com/api/v3/depth",
+                    params={"symbol": symbol, "limit": depth_limit},
+                    timeout=5,
+                )
+                if resp.status_code in (451, 403):
+                    # Geo-blocked — can't get depth data
+                    continue
+                if resp.status_code != 200:
+                    continue
+
+                data = resp.json()
+                bids = data.get("bids", [])  # [[price, qty], ...]
+                asks = data.get("asks", [])
+
+                bid_qty = sum(float(b[1]) for b in bids)
+                ask_qty = sum(float(a[1]) for a in asks)
+                total = bid_qty + ask_qty
+
+                if total > 0:
+                    obi = (bid_qty - ask_qty) / total
+                    results[coin_key] = obi
+
+            except Exception:
+                continue  # Non-critical — skip silently
+
+        return results
+
+    # ========================================================================
     # Binance API (crypto)
     # ========================================================================
 

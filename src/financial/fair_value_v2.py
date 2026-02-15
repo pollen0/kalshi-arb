@@ -126,6 +126,7 @@ class SophisticatedFairValue:
         self.options_implied_vols: dict = {}  # Cached implied vols
         self.options_skew = options_skew or {}
         self.event_calendar = None  # EventCalendar instance for vol boost near FOMC/CPI
+        self.crypto_obi: dict = {}  # Binance orderbook imbalance per crypto asset
 
     def set_options_client(self, client):
         """Set options data client for implied volatility"""
@@ -409,7 +410,7 @@ class SophisticatedFairValue:
             trading_days = effective_hours / hours_per_day
             time_years = trading_days / 252
 
-        # Compute skew as drift: prefer options skew, fall back to momentum skew
+        # Compute skew as drift: prefer options skew, fall back to OBI or momentum skew
         # Drift is applied inside the distribution (shifts the log-mean)
         # rather than added to the final probability.
         options_skew_val = self.options_skew.get(index_lower)
@@ -417,6 +418,16 @@ class SophisticatedFairValue:
             # Options put-call skew: positive = puts more expensive = downside risk
             # Negative drift because high put premium = bearish
             skew = -options_skew_val * 0.5
+        elif index_lower in self.crypto_obi:
+            # Binance orderbook imbalance: cross-market directional signal
+            # OBI range: -1 (bearish) to +1 (bullish)
+            # Scale to small drift: OBI of 0.5 -> ~2.5% drift (dampened)
+            # Only act on meaningful imbalance (|OBI| > 0.15 threshold)
+            obi = self.crypto_obi[index_lower]
+            if abs(obi) > 0.15:
+                skew = obi * 0.05  # Max ±5% drift at extreme OBI
+            else:
+                skew = 0.0  # Below noise threshold
         else:
             skew = self._get_momentum_skew(index)
 

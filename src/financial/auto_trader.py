@@ -1273,6 +1273,88 @@ class AutoTrader:
 
         return results
 
+    def find_range_arb_opportunities(self, markets: list[Market]) -> list[tuple[str, list[Market], int]]:
+        """
+        Find range completeness arbitrage opportunities.
+
+        For a given expiration, all range contracts should sum to 100 cents.
+        If sum(best_asks) < 100: buy all → riskless profit = 100 - sum
+        If sum(best_bids) > 100: sell all → riskless profit = sum - 100
+
+        Returns list of (action, markets_in_group, edge_cents) where
+        action is "buy_all" or "sell_all".
+        """
+        # Group RANGE markets by event_ticker (same expiration)
+        from collections import defaultdict
+        groups: dict[str, list[Market]] = defaultdict(list)
+        for m in markets:
+            if m.market_type == MarketType.FINANCIAL_RANGE and m.lower_bound is not None and m.upper_bound is not None:
+                groups[m.event_ticker].append(m)
+
+        opportunities = []
+        for event_ticker, group in groups.items():
+            if len(group) < 3:
+                continue  # Need multiple ranges to form a complete set
+
+            # Sort by lower bound to verify contiguity
+            group.sort(key=lambda m: m.lower_bound or 0)
+
+            # Check ask-side arb: buy ALL ranges
+            # If sum of asks < 100, buying all guarantees profit (exactly one settles to 100)
+            total_asks = sum(m.yes_ask or 100 for m in group)
+            if total_asks < 100:
+                edge_cents = 100 - total_asks
+                if edge_cents >= 2:  # Minimum 2c edge to cover fees
+                    opportunities.append(("buy_all", group, edge_cents))
+                    print(f"[ARB] Range completeness: {event_ticker} "
+                          f"sum(asks)={total_asks}c → buy all for {edge_cents}c riskless profit")
+
+            # Check bid-side arb: sell ALL ranges
+            # If sum of bids > 100, selling all guarantees profit (pay out exactly 100)
+            total_bids = sum(m.yes_bid or 0 for m in group)
+            if total_bids > 100:
+                edge_cents = total_bids - 100
+                if edge_cents >= 2:
+                    opportunities.append(("sell_all", group, edge_cents))
+                    print(f"[ARB] Range completeness: {event_ticker} "
+                          f"sum(bids)={total_bids}c → sell all for {edge_cents}c riskless profit")
+
+        return opportunities
+
+    def execute_range_arb(self, action: str, group: list[Market], edge_cents: int) -> int:
+        """
+        Execute a range completeness arb by placing orders on all legs.
+
+        Returns number of orders successfully placed.
+        """
+        orders_placed = 0
+        size = min(self.config.position_size, 10)  # Conservative size for arb
+
+        for m in group:
+            if action == "buy_all":
+                # Buy YES at ask price
+                price = m.yes_ask or 100
+                if price >= 99:
+                    continue  # Can't buy at 99+
+                side = "yes"
+            else:
+                # Sell YES (buy NO) at bid price
+                price = m.yes_bid or 0
+                if price <= 1:
+                    continue  # Can't sell at 1 or below
+                side = "no"
+                price = 100 - price  # Convert to NO price
+
+            order_id = self.place_order(m, side, price)
+            if order_id:
+                orders_placed += 1
+
+        if orders_placed > 0:
+            print(f"[ARB] Placed {orders_placed}/{len(group)} legs for {action}, "
+                  f"target edge {edge_cents}c")
+
+        return orders_placed
+
     def place_mm_order(self, market: Market, side: str, price: int) -> Optional[str]:
         """Place a market-making order and track it separately from directional orders."""
         order_id = self.place_order(market, side, price)
@@ -2266,6 +2348,17 @@ class AutoTrader:
                         self.place_mm_order(market, side, price)
                         ops_this_loop += 1
                         available_capital -= actual_cost
+
+            # PHASE 5: Range completeness arbitrage (riskless profit when ranges misprice)
+            if ops_this_loop < max_ops_per_loop and available_capital > min_order_cost:
+                arb_opps = self.find_range_arb_opportunities(markets)
+                for action, group, edge_cents in arb_opps:
+                    if ops_this_loop >= max_ops_per_loop:
+                        break
+                    if available_capital < min_order_cost * len(group):
+                        break
+                    legs_placed = self.execute_range_arb(action, group, edge_cents)
+                    ops_this_loop += legs_placed
 
         except Exception as e:
             self.record_error(e, message="Trading loop")

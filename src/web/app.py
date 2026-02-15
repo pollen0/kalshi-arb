@@ -1085,6 +1085,14 @@ def create_app():
                                     m.fair_value_time = datetime.now(timezone.utc)
                                     m.model_source = f"ES={es.price:.0f} [{fv_result.vol_source}]"
 
+                    # Update Binance orderbook imbalance for crypto drift signal
+                    try:
+                        obi_data = state["futures"].get_binance_obi(depth_limit=20)
+                        if obi_data and fv_model:
+                            fv_model.crypto_obi.update(obi_data)
+                    except Exception:
+                        pass  # Non-critical — don't let OBI errors affect trading
+
                     # Recalc crypto fair values (5s refresh instead of 30s)
                     crypto_map = {
                         "bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL",
