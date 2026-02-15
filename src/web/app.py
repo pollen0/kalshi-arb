@@ -2921,6 +2921,9 @@ DASHBOARD_HTML = '''
 
     function renderAccordions(data) {
         const c = document.getElementById('asset-accordions');
+        // Preserve which accordions are open across re-renders
+        const openSet = new Set();
+        c.querySelectorAll('details[open]').forEach(d => openSet.add(d.id));
         c.innerHTML = SECTIONS.map((s,i) => {
             const d = data[s.k]; if (!d) return '';
             const mkts = d[s.s]||[];
@@ -2940,6 +2943,8 @@ DASHBOARD_HTML = '''
                 </table></div>
             </details>`;
         }).join('');
+        // Restore open state
+        openSet.forEach(id => { const el=document.getElementById(id); if(el) el.open=true; });
 
         SECTIONS.forEach((s,i) => {
             const d = data[s.k]; if (!d) return;
