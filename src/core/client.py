@@ -396,6 +396,26 @@ class KalshiClient:
             lower = m.get("floor_strike")
             upper = m.get("cap_strike")
 
+            # Fallback: check custom_strike object (used by crypto markets)
+            if lower is None and upper is None:
+                custom = m.get("custom_strike")
+                if custom and isinstance(custom, dict):
+                    strike_type = custom.get("strike_type", "")
+                    floor_str = custom.get("floor_strike", "")
+                    cap_str = custom.get("cap_strike", "")
+                    try:
+                        if strike_type == "between":
+                            lower = float(floor_str) if floor_str else None
+                            upper = float(cap_str) if cap_str else None
+                        elif strike_type == "greater":
+                            lower = float(floor_str) if floor_str else None
+                            upper = None
+                        elif strike_type == "less":
+                            lower = None
+                            upper = float(cap_str) if cap_str else None
+                    except (ValueError, TypeError):
+                        pass
+
             # Fallback to parsing from title if not provided
             if lower is None and upper is None:
                 lower, upper = self._parse_bounds(m.get("title", ""))
@@ -459,6 +479,18 @@ class KalshiClient:
 
     def _detect_market_type(self, m: dict) -> MarketType:
         """Detect market type from market data"""
+        # Check custom_strike.strike_type first (used by crypto markets)
+        custom = m.get("custom_strike")
+        if custom and isinstance(custom, dict):
+            strike_type = custom.get("strike_type", "")
+            if strike_type == "between":
+                return MarketType.FINANCIAL_RANGE
+            elif strike_type == "greater":
+                return MarketType.FINANCIAL_ABOVE
+            elif strike_type == "less":
+                return MarketType.FINANCIAL_BELOW
+
+        # Fallback to title-based detection
         title = (m.get("title", "") + " " + m.get("subtitle", "")).lower()
 
         if "between" in title:
