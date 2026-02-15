@@ -615,13 +615,13 @@ class AutoTrader:
         prev_reason = self._halt_reason
         old_starting = self._starting_balance
 
-        self._halted = False
-        self._halt_reason = ""
-        self._error_history.clear()
+        # IMPORTANT: Compute new baseline BEFORE clearing _halted.
+        # The trading loop runs every 1s on another thread.  If we set
+        # _halted=False first, check_safety() can see the OLD _starting_balance
+        # and immediately re-halt (race condition).
 
         # Reset daily tracking using COST-BASIS equity (cash + sum(qty * avg_price))
         # to match what check_safety() uses for the daily loss check.
-        # Using MTM equity here caused immediate re-halts when MTM > cost-basis.
         balance = self.client.get_balance() or self._last_known_balance or 0
         cost_basis_equity = balance
         with self._lock:
@@ -632,6 +632,11 @@ class AutoTrader:
         self._starting_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         self._peak_equity = self.get_portfolio_value()  # Peak uses MTM for drawdown check
         self._save_daily_state()
+        self._error_history.clear()
+
+        # Clear halt flag LAST — trading loop now sees correct _starting_balance
+        self._halt_reason = ""
+        self._halted = False
 
         print(f"\n[{timestamp}] HALT STATE RESET")
         print(f"    Previous halt reason: {prev_reason}")
